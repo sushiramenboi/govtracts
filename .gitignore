@@ -26,3 +26,12 @@ out/
 .DS_Store
 .idea/
 .vscode/
+
+
+#added by me
+.env
+.env.local
+__pycache__/
+.venv/
+node_modules/
+.next/
