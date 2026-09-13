@@ -1,6 +1,6 @@
 # Govtracts
 
-Govtracts is a federal-contract intelligence platform for small cybersecurity and IT vendors. This repository currently contains only the Milestone 1 application foundation; it does not ingest USAspending or SAM.gov data, rank opportunities, or provide authentication.
+Govtracts is a federal-contract intelligence platform for small cybersecurity and IT vendors. Milestone 2 adds a configurable Cyber/IT market-research preset and historical contract-award ingestion from the official USAspending API. It does not ingest SAM.gov data, rank opportunities, or provide authentication.
 
 ## Prerequisites
 
@@ -24,6 +24,8 @@ postgresql+psycopg://<user>:<password>@<host>:5432/<database>
 ```
 
 Do not commit either local environment file. `SAM_GOV_API_KEY` is not part of this milestone and is not needed to run the foundation.
+
+`NEXT_PUBLIC_API_BASE_URL` is the public backend address used by the browser. For local development, set it to `http://127.0.0.1:8000`; never put database URLs, passwords, or API keys in a `NEXT_PUBLIC_` variable.
 
 ## Start the backend
 
@@ -59,6 +61,30 @@ alembic current
 
 The migration creates the foundation tables only: `agencies`, `vendors`, `awards`, `opportunities`, `upstream_cache`, and `ingestion_runs`. It creates no seed data and has no reset or drop command in the normal setup path.
 
+## Ingest USAspending Cyber/IT awards
+
+The Cyber/IT preset combines explicitly listed NAICS codes, PSC codes, and cybersecurity keywords. It is a configurable market-research filter, not a claim that it identifies all cybersecurity spending.
+
+Start with a bounded import:
+
+```sh
+cd services/api
+source .venv/bin/activate
+python -m app.usaspending \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --max-pages 1
+```
+
+For a historical import, omit `--max-pages` only after confirming the bounded run completes successfully. The command uses public USAspending requests without credentials, retries transient failures with backoff, records a sanitized run status, and can safely be re-run for the same date range.
+
+Once data is loaded, the API provides:
+
+- `GET /v1/market-overview`
+- `GET /v1/awards`
+- `GET /v1/awards/{generated_internal_id}`
+- `GET /health/datasets/usaspending`
+
 ## Start the frontend
 
 ```sh
@@ -67,7 +93,7 @@ npm install
 npm run dev
 ```
 
-Set `NEXT_PUBLIC_API_BASE_URL` in `apps/web/.env.local` when the frontend needs to call a separately hosted API. This value may be public; database URLs and API keys must never use a `NEXT_PUBLIC_` variable.
+Set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000` in `apps/web/.env.local` for local development. This value may be public; database URLs and API keys must never use a `NEXT_PUBLIC_` variable.
 
 ## Tests and checks
 

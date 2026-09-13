@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     cors_origins: str = ""
+    usaspending_base_url: str = "https://api.usaspending.gov"
+    usaspending_connect_timeout_seconds: float = 5.0
+    usaspending_read_timeout_seconds: float = 30.0
+    usaspending_max_retries: int = 3
+    usaspending_dataset_stale_after_hours: int = 24
 
     @property
     def allowed_origins(self) -> list[str]:
@@ -28,6 +33,14 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: object) -> None:
         if not self.database_url.startswith("postgresql+psycopg://"):
             raise ValueError("DATABASE_URL must use the postgresql+psycopg driver URL format")
+        if not self.usaspending_base_url.startswith("https://"):
+            raise ValueError("USASPENDING_BASE_URL must use HTTPS")
+        if self.usaspending_connect_timeout_seconds <= 0 or self.usaspending_read_timeout_seconds <= 0:
+            raise ValueError("USAspending timeouts must be positive")
+        if not 0 <= self.usaspending_max_retries <= 5:
+            raise ValueError("USASPENDING_MAX_RETRIES must be between 0 and 5")
+        if self.usaspending_dataset_stale_after_hours <= 0:
+            raise ValueError("USASPENDING_DATASET_STALE_AFTER_HOURS must be positive")
 
 
 @lru_cache

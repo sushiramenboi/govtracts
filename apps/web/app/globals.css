@@ -18,15 +18,11 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
-.foundation-shell {
-  display: grid;
-  min-height: 100vh;
-  max-width: 58rem;
-  margin: 0 auto;
-  align-content: center;
-  gap: 1.25rem;
-  padding: 2rem;
-}
+.dashboard-shell { max-width: 76rem; margin: 0 auto; padding: 1.25rem; }
+.dashboard-header { display:flex; justify-content:space-between; gap:1rem; align-items:center; border-bottom:1px solid #203746; padding:1rem 0 1.5rem; color:#a9bdc9; }
+.brand { color:#e8f0f7; font-size:1.35rem; font-weight:800; text-decoration:none; }
+.preset { max-width:52rem; padding:4rem 0 2rem; }.preset h1 { max-width:18ch; }.preset p:not(.eyebrow) { color:#b9c9d5; line-height:1.6; }
+.metrics,.rankings { display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; margin:1rem 0; }.metrics article,.panel,.notice { border:1px solid #24495a; border-radius:1rem; background:#0b1c28; padding:1.25rem; }.metrics span { color:#a9bdc9; display:block; }.metrics strong { display:block; font-size:clamp(1.35rem,3vw,2rem); margin-top:.55rem; }.panel h2 { margin-top:0; font-size:1rem; }.chart { margin:1rem 0; }.rankings { grid-template-columns:repeat(2,1fr); }.rank-list { list-style:none; padding:0; margin:0; }.rank-list li { display:flex; justify-content:space-between; gap:1rem; padding:.7rem 0; border-top:1px solid #203746; }.rank-list small { display:block; color:#8aa2b2; margin-top:.15rem; }.table-wrap { overflow-x:auto; } table { width:100%; border-collapse:collapse; min-width:42rem; } th,td { padding:.75rem; text-align:left; border-top:1px solid #203746; } th { color:#a9bdc9; font-size:.75rem; text-transform:uppercase; } a { color:#70e2ca; }.notice { margin-top:2rem; color:#c4d5df; }.error { border-color:#a75b64; color:#ffc0c4; }.attribution { color:#8aa2b2; font-size:.9rem; padding:1rem 0 2rem; }
 
 .eyebrow {
   margin: 0;
@@ -43,19 +39,4 @@ h1 {
   line-height: 0.98;
 }
 
-.summary {
-  max-width: 42rem;
-  margin: 0;
-  color: #b9c9d5;
-  font-size: 1.125rem;
-  line-height: 1.6;
-}
-
-.status {
-  width: fit-content;
-  margin: 0;
-  padding: 0.55rem 0.8rem;
-  border: 1px solid #24495a;
-  border-radius: 999px;
-  color: #a9d8ff;
-}
+@media (max-width: 700px) { .dashboard-header,.metrics,.rankings { grid-template-columns:1fr; display:grid; }.dashboard-header { justify-items:start; }.preset { padding-top:2.5rem; } }

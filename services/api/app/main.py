@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
+from app.api.routes.market import router as market_router
 from app.core.config import Settings, load_settings
 from app.db.session import Database
 
@@ -18,6 +19,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.settings = resolved_settings
         app.state.database = Database(resolved_settings)
         try:
             yield
@@ -33,4 +35,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=[],
     )
     app.include_router(health_router)
+    app.include_router(market_router)
     return app
