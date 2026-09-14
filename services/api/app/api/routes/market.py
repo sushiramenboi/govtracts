@@ -63,7 +63,7 @@ def market_overview(
         "trend": [{"period": row[0], "amount": row[1]} for row in trend],
         "top_agencies": [{"name": row.name, "code": row.external_code, "amount": row.amount, "award_count": row.count} for row in agencies],
         "top_vendors": [{"name": row.canonical_name, "amount": row.amount, "award_count": row.count} for row in vendors],
-        "recent_awards": [_award_item(row.Award, row.agency_name, row.vendor_name) for row in recent],
+        "recent_awards": [_award_item(row, row.agency_name, row.vendor_name) for row in recent],
         "source": {"name": "USAspending.gov", "url": "https://api.usaspending.gov/docs/endpoints", "last_successful_refresh": freshness},
     }
 
@@ -103,7 +103,7 @@ def list_awards(
             rows = connection.execute(base.order_by(Award.base_obligation_date.desc().nullslast(), Award.usa_generated_id).offset((page - 1) * page_size).limit(page_size)).all()
     except SQLAlchemyError:
         raise HTTPException(status_code=503, detail={"status": "not_ready"}) from None
-    return {"items": [_award_item(row.Award, row.agency_name, row.vendor_name) for row in rows], "page": page, "page_size": page_size, "total": total}
+    return {"items": [_award_item(row, row.agency_name, row.vendor_name) for row in rows], "page": page, "page_size": page_size, "total": total}
 
 
 @router.get("/awards/{award_id}")
@@ -115,11 +115,27 @@ def get_award(award_id: str, database: Annotated[Database, Depends(get_database)
         raise HTTPException(status_code=503, detail={"status": "not_ready"}) from None
     if row is None:
         raise HTTPException(status_code=404, detail={"status": "not_found"})
-    item = _award_item(row.Award, row.agency_name, row.vendor_name)
-    item["description"] = row.Award.description
-    item["raw_payload"] = row.Award.raw_payload
+    item = _award_item(row, row.agency_name, row.vendor_name)
+    item["description"] = _award_value(row, "description")
+    item["raw_payload"] = _award_value(row, "raw_payload")
     return item
 
 
-def _award_item(award: Award, agency_name: str | None, vendor_name: str | None) -> dict[str, object]:
-    return {"id": award.usa_generated_id, "award_id": award.award_id, "agency": agency_name, "vendor": vendor_name, "naics_code": award.naics_code, "psc_code": award.psc_code, "obligation_amount": award.obligation_amount, "base_obligation_date": award.base_obligation_date, "award_type": award.award_type, "source_url": award.source_url}
+def _award_value(award: object, name: str) -> object:
+    mapping = getattr(award, "_mapping", None)
+    return mapping[name] if mapping is not None else getattr(award, name)
+
+
+def _award_item(award: object, agency_name: str | None, vendor_name: str | None) -> dict[str, object]:
+    return {
+        "id": _award_value(award, "usa_generated_id"),
+        "award_id": _award_value(award, "award_id"),
+        "agency": agency_name,
+        "vendor": vendor_name,
+        "naics_code": _award_value(award, "naics_code"),
+        "psc_code": _award_value(award, "psc_code"),
+        "obligation_amount": _award_value(award, "obligation_amount"),
+        "base_obligation_date": _award_value(award, "base_obligation_date"),
+        "award_type": _award_value(award, "award_type"),
+        "source_url": _award_value(award, "source_url"),
+    }
