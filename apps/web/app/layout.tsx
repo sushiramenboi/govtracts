@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Govtracts",
-  description: "Federal-contract intelligence for small IT vendors.",
+  title: "Govtracts | Federal contract intelligence",
+  description: "Source-attributed federal Cyber/IT contract market research.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
