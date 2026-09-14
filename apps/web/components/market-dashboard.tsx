@@ -1,21 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { getOverview, money, type Overview } from "../lib/api";
+import { money, type Overview } from "../lib/api";
 
-export function MarketDashboard() {
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [error, setError] = useState<string | null>(null);
+type MarketDashboardProps = {
+  initialOverview: Overview | null;
+  initialError?: string | null;
+};
 
-  useEffect(() => {
-    const controller = new AbortController();
-    getOverview(controller.signal).then(setOverview).catch((reason: unknown) => {
-      if ((reason as Error).name !== "AbortError") setError("Unable to load live market data. Start the API and run an ingestion first.");
-    });
-    return () => controller.abort();
-  }, []);
+export function MarketDashboard({ initialOverview, initialError = null }: MarketDashboardProps) {
+  const overview = initialOverview;
+  const error = initialError;
 
   if (error) return <main className="dashboard-shell"><DashboardHeader /><section className="notice error">{error}</section></main>;
   if (!overview) return <main className="dashboard-shell"><DashboardHeader /><section className="notice">Loading USAspending market data…</section></main>;
