@@ -20,7 +20,7 @@ export type Overview = {
 };
 
 export async function getOverview(signal?: AbortSignal): Promise<Overview> {
-  const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+  const baseUrl = process.env.INTERNAL_API_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
   const response = await fetch(`${baseUrl}/v1/market-overview`, { signal });
   if (!response.ok) throw new Error("The Govtracts API could not load market data.");
   return response.json() as Promise<Overview>;
