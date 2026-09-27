@@ -6,14 +6,17 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -166,3 +169,153 @@ class IngestionRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     data_freshness_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class UsaSpendingIngestionCheckpoint(TimestampedModel, Base):
+    __tablename__ = "usaspending_ingestion_checkpoints"
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "period_start",
+            "period_end",
+            name="uq_usaspending_checkpoints_source_period",
+        ),
+        CheckConstraint("period_end >= period_start", name="period_order"),
+        CheckConstraint("expected_rows IS NULL OR expected_rows >= 0", name="expected_rows_nonnegative"),
+        CheckConstraint("loaded_rows >= 0", name="loaded_rows_nonnegative"),
+        Index("ix_usaspending_checkpoints_fiscal_period", "fiscal_year", "period_start", "period_end"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="usaspending")
+    fiscal_year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    status_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    remote_file_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    archive_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expected_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    loaded_rows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UsaSpendingTransaction(TimestampedModel, Base):
+    __tablename__ = "usaspending_transactions"
+    __table_args__ = (
+        CheckConstraint("award_type_code IN ('A', 'B', 'C', 'D')", name="prime_award_type"),
+        CheckConstraint("fiscal_year BETWEEN 2000 AND 9999", name="fiscal_year_range"),
+        Index("ix_usaspending_transactions_checkpoint", "ingestion_checkpoint_id"),
+        Index("ix_usaspending_transactions_fiscal_action", "fiscal_year", "action_date"),
+        Index("ix_usaspending_transactions_award_action", "generated_award_id", "action_date"),
+        Index("ix_usaspending_transactions_fiscal_agency", "fiscal_year", "awarding_agency_name"),
+        Index("ix_usaspending_transactions_fiscal_recipient", "fiscal_year", "recipient_uei"),
+        Index("ix_usaspending_transactions_fiscal_naics", "fiscal_year", "naics_code"),
+        Index("ix_usaspending_transactions_fiscal_psc", "fiscal_year", "psc_code"),
+    )
+
+    stable_transaction_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    ingestion_checkpoint_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("usaspending_ingestion_checkpoints.id", name="fk_usaspending_tx_checkpoint", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    generated_award_id: Mapped[str] = mapped_column(
+        String(512),
+        ForeignKey("awards.usa_generated_id", name="fk_usaspending_tx_award", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    display_award_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    award_type_code: Mapped[str] = mapped_column(String(1), nullable=False)
+    action_date: Mapped[date] = mapped_column(Date, nullable=False)
+    fiscal_year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    federal_action_obligation: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    recipient_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    recipient_uei: Mapped[str] = mapped_column(String(12), nullable=False)
+    recipient_parent_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    recipient_parent_uei: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    awarding_agency_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    awarding_subagency_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    naics_code: Mapped[str | None] = mapped_column(String(6), nullable=True)
+    psc_code: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    transaction_description: Mapped[str] = mapped_column(Text, nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class UsaSpendingTransactionPresetMatch(Base):
+    __tablename__ = "usaspending_transaction_preset_matches"
+    __table_args__ = (
+        CheckConstraint("preset_version > 0", name="version_positive"),
+        CheckConstraint("match_basis IN ('naics', 'psc', 'both')", name="match_basis"),
+        Index(
+            "ix_usaspending_preset_matches_preset_transaction",
+            "preset_key",
+            "preset_version",
+            "stable_transaction_id",
+        ),
+    )
+
+    stable_transaction_id: Mapped[str] = mapped_column(
+        String(512),
+        ForeignKey(
+            "usaspending_transactions.stable_transaction_id",
+            name="fk_usaspending_preset_match_transaction",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    preset_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    preset_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    match_basis: Mapped[str] = mapped_column(String(16), nullable=False)
+    matched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class UsaSpendingPeriodAggregate(TimestampedModel, Base):
+    __tablename__ = "usaspending_period_aggregates"
+    __table_args__ = (
+        UniqueConstraint(
+            "fiscal_year",
+            "period_start",
+            "period_end",
+            "preset_key",
+            "preset_version",
+            "dimension_type",
+            "dimension_key",
+            name="uq_usaspending_period_aggregates_grain",
+        ),
+        CheckConstraint("period_end >= period_start", name="period_order"),
+        CheckConstraint("preset_version > 0", name="preset_version_positive"),
+        CheckConstraint("gross_positive_obligations >= 0", name="gross_positive_nonnegative"),
+        CheckConstraint("signed_deobligations <= 0", name="signed_deob_nonpositive"),
+        CheckConstraint(
+            "net_obligations = gross_positive_obligations + signed_deobligations",
+            name="net_obligations_formula",
+        ),
+        CheckConstraint("transaction_count >= 0", name="transaction_count_nonnegative"),
+        CheckConstraint("distinct_award_count >= 0", name="award_count_nonnegative"),
+        Index(
+            "ix_usaspending_period_aggregates_ranking",
+            "fiscal_year",
+            "preset_key",
+            "preset_version",
+            "dimension_type",
+            "net_obligations",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    fiscal_year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    preset_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    preset_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dimension_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    dimension_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    gross_positive_obligations: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    signed_deobligations: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    net_obligations: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    transaction_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    distinct_award_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
