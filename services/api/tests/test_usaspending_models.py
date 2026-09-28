@@ -91,9 +91,10 @@ def test_usaspending_schema_declares_exact_grain_constraints_and_indexes() -> No
         foreign_key.constraint.name: foreign_key.target_fullname for foreign_key in transaction.foreign_keys
     }
     assert transaction_foreign_keys == {
-        "fk_usaspending_tx_award": "awards.usa_generated_id",
         "fk_usaspending_tx_checkpoint": "usaspending_ingestion_checkpoints.id",
     }
+    assert transaction.c.generated_award_id.nullable is False
+    assert transaction.c.generated_award_id.type.length == 512
     assert {index.name for index in transaction.indexes} == {
         "ix_usaspending_transactions_award_action",
         "ix_usaspending_transactions_checkpoint",

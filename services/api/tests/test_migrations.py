@@ -17,7 +17,7 @@ def test_initial_migration_is_the_only_head_revision() -> None:
     config = Config(str(API_ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260927_0002"]
+    assert script.get_heads() == ["20260927_0003"]
 
 
 @pytest.mark.integration

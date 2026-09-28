@@ -223,7 +223,6 @@ class UsaSpendingTransaction(TimestampedModel, Base):
     )
     generated_award_id: Mapped[str] = mapped_column(
         String(512),
-        ForeignKey("awards.usa_generated_id", name="fk_usaspending_tx_award", ondelete="RESTRICT"),
         nullable=False,
     )
     display_award_id: Mapped[str] = mapped_column(String(255), nullable=False)
