@@ -201,6 +201,117 @@ class UsaSpendingIngestionCheckpoint(TimestampedModel, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class UsaSpendingTransactionIngestionAttempt(Base):
+    __tablename__ = "usaspending_transaction_ingestion_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('created', 'counted', 'submitting', 'submitted', "
+            "'export_finished', 'archive_hashed', 'loading', 'completed', "
+            "'failed', 'submission_unknown')",
+            name="status_allowed",
+        ),
+        CheckConstraint("period_end >= period_start", name="period_order"),
+        CheckConstraint("fiscal_year BETWEEN 2000 AND 9999", name="fiscal_year_range"),
+        CheckConstraint(
+            "(expected_rows IS NULL OR expected_rows >= 0) AND "
+            "(archive_bytes IS NULL OR archive_bytes >= 0) AND "
+            "(loaded_rows IS NULL OR loaded_rows >= 0) AND failure_count >= 0",
+            name="counts_nonneg",
+        ),
+        CheckConstraint(
+            "status NOT IN ('counted', 'submitting', 'submitted', "
+            "'export_finished', 'archive_hashed', 'loading', 'completed', "
+            "'submission_unknown') OR expected_rows IS NOT NULL",
+            name="count_metadata",
+        ),
+        CheckConstraint(
+            "archive_sha256 IS NULL OR ("
+            "length(archive_sha256) = 64 AND "
+            "archive_sha256 = lower(archive_sha256) AND "
+            "replace(replace(replace(replace(replace(replace(replace(replace("
+            "replace(replace(replace(replace(replace(replace(replace(replace("
+            "archive_sha256, '0', ''), '1', ''), '2', ''), '3', ''), "
+            "'4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', ''), "
+            "'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '') = '')",
+            name="hash_lower_hex",
+        ),
+        CheckConstraint(
+            "status NOT IN ('submitted', 'export_finished', 'archive_hashed', "
+            "'loading', 'completed') OR "
+            "(status_url IS NOT NULL AND file_url IS NOT NULL "
+            "AND remote_file_name IS NOT NULL)",
+            name="job_metadata",
+        ),
+        CheckConstraint(
+            "status NOT IN ('archive_hashed', 'loading', 'completed') OR "
+            "(archive_sha256 IS NOT NULL AND archive_bytes IS NOT NULL)",
+            name="archive_metadata",
+        ),
+        CheckConstraint(
+            "((status IN ('completed', 'failed')) = (completed_at IS NOT NULL)) AND "
+            "(status != 'completed' OR "
+            "(checkpoint_id IS NOT NULL AND expected_rows IS NOT NULL "
+            "AND loaded_rows IS NOT NULL AND expected_rows = loaded_rows "
+            "AND signed_obligation_total IS NOT NULL))",
+            name="terminal_fields",
+        ),
+        CheckConstraint(
+            "status NOT IN ('failed', 'submission_unknown') "
+            "OR last_error_code IS NOT NULL",
+            name="error_metadata",
+        ),
+        Index(
+            "uq_usaspending_attempts_active_period",
+            "source",
+            "period_start",
+            "period_end",
+            unique=True,
+            postgresql_where=text("status NOT IN ('completed', 'failed')"),
+            sqlite_where=text("status NOT IN ('completed', 'failed')"),
+        ),
+        Index(
+            "ix_usaspending_attempts_period_status",
+            "source",
+            "period_start",
+            "period_end",
+            "status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="usaspending")
+    fiscal_year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    expected_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    file_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    remote_file_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    archive_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    archive_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    loaded_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    signed_obligation_total: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+    checkpoint_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey(
+            "usaspending_ingestion_checkpoints.id",
+            name="fk_usaspending_attempt_checkpoint",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class UsaSpendingTransaction(TimestampedModel, Base):
     __tablename__ = "usaspending_transactions"
     __table_args__ = (
