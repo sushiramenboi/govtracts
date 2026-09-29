@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
@@ -31,6 +32,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.engine import Connection
 
 from app.db.models import UsaSpendingIngestionCheckpoint, UsaSpendingTransaction
 from app.usaspending.fiscal_years import fiscal_month_bounds
@@ -47,6 +49,7 @@ LOADING_STATUS = "loading"
 TEMPORARY_STAGE_TABLE = "usaspending_transaction_stage"
 DEFAULT_BATCH_SIZE = 2_000
 ZERO_MONEY = Decimal("0.00")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class TransactionIngestionError(RuntimeError):
@@ -112,6 +115,89 @@ class TransactionIngestionLoader:
         bulk_job: BulkJobMetadata,
     ) -> TransactionIngestionResult:
         """Validate, reconcile, and atomically replace one exact calendar month."""
+        self._validate_load_inputs(
+            fiscal_year=fiscal_year,
+            period_start=period_start,
+            period_end=period_end,
+            expected_count=expected_count,
+            bulk_job=bulk_job,
+        )
+        with self._engine.begin() as connection:
+            return self.load_with_connection(
+                connection,
+                archive_path=archive_path,
+                fiscal_year=fiscal_year,
+                period_start=period_start,
+                period_end=period_end,
+                expected_count=expected_count,
+                bulk_job=bulk_job,
+            )
+
+    def load_with_connection(
+        self,
+        connection: Connection,
+        *,
+        archive_path: str | os.PathLike[str],
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+        expected_count: int,
+        bulk_job: BulkJobMetadata,
+        expected_archive_sha256: str | None = None,
+    ) -> TransactionIngestionResult:
+        """Load through a caller-owned active PostgreSQL transaction."""
+        self._validate_connection(connection)
+        self._validate_load_inputs(
+            fiscal_year=fiscal_year,
+            period_start=period_start,
+            period_end=period_end,
+            expected_count=expected_count,
+            bulk_job=bulk_job,
+        )
+        if expected_archive_sha256 is not None and (
+            not isinstance(expected_archive_sha256, str)
+            or SHA256_PATTERN.fullmatch(expected_archive_sha256) is None
+        ):
+            raise TransactionIngestionError("invalid_expected_archive_sha256")
+
+        lock_key = _advisory_lock_key(SOURCE, period_start, period_end)
+        with _private_archive_copy(Path(archive_path)) as (
+            immutable_archive_path,
+            archive_sha256,
+        ):
+            if (
+                expected_archive_sha256 is not None
+                and archive_sha256 != expected_archive_sha256
+            ):
+                raise TransactionIngestionError("archive_sha256_mismatch")
+            return self._load_snapshot(
+                connection,
+                archive_path=immutable_archive_path,
+                archive_sha256=archive_sha256,
+                fiscal_year=fiscal_year,
+                period_start=period_start,
+                period_end=period_end,
+                expected_count=expected_count,
+                bulk_job=bulk_job,
+                lock_key=lock_key,
+            )
+
+    @staticmethod
+    def _validate_connection(connection: Connection) -> None:
+        if connection.dialect.name != "postgresql":
+            raise TransactionIngestionError("postgresql_connection_required")
+        if not connection.in_transaction():
+            raise TransactionIngestionError("active_transaction_required")
+
+    def _validate_load_inputs(
+        self,
+        *,
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+        expected_count: int,
+        bulk_job: BulkJobMetadata,
+    ) -> None:
         self._validate_period(fiscal_year, period_start, period_end)
         if (
             isinstance(expected_count, bool)
@@ -120,24 +206,6 @@ class TransactionIngestionLoader:
         ):
             raise TransactionIngestionError("invalid_expected_count")
         self._validate_checkpoint_metadata(bulk_job)
-
-        lock_key = _advisory_lock_key(SOURCE, period_start, period_end)
-        with self._engine.begin() as connection:
-            with _private_archive_copy(Path(archive_path)) as (
-                immutable_archive_path,
-                archive_sha256,
-            ):
-                return self._load_snapshot(
-                    connection,
-                    archive_path=immutable_archive_path,
-                    archive_sha256=archive_sha256,
-                    fiscal_year=fiscal_year,
-                    period_start=period_start,
-                    period_end=period_end,
-                    expected_count=expected_count,
-                    bulk_job=bulk_job,
-                    lock_key=lock_key,
-                )
 
     def _load_snapshot(
         self,

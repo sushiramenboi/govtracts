@@ -18,12 +18,16 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, func, select, text, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
-from app.db.models import UsaSpendingIngestionCheckpoint, UsaSpendingTransaction
+from app.db.models import (
+    UsaSpendingIngestionCheckpoint,
+    UsaSpendingTransaction,
+    UsaSpendingTransactionIngestionAttempt,
+)
 from app.usaspending import transaction_ingestion as transaction_ingestion_module
 from app.usaspending.transaction_export import (
     EXPECTED_TRANSACTION_HEADERS,
@@ -120,6 +124,8 @@ class FakeDatabaseState:
 
 
 class FakeConnection:
+    dialect = SimpleNamespace(name="postgresql")
+
     def __init__(self, state: FakeDatabaseState) -> None:
         self.state = state
         self.stage: dict[str, dict[str, Any]] = {}
@@ -128,6 +134,10 @@ class FakeConnection:
         self.stage_total_override: Decimal | None = None
         self.target_total_override: Decimal | None = None
         self.lock_keys: list[int] = []
+        self._in_transaction = False
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
 
     def execute(self, statement: Any, parameters: Any = None) -> FakeResult:
         compiled = statement.compile(dialect=postgresql.dialect())
@@ -245,6 +255,7 @@ class FakeEngine:
     def begin(self) -> Iterator[FakeConnection]:
         snapshot = copy.deepcopy(self.state)
         self.connection.stage = {}
+        self.connection._in_transaction = True
         try:
             yield self.connection
         except BaseException:
@@ -256,6 +267,7 @@ class FakeEngine:
             self.commits += 1
         finally:
             self.connection.stage = {}
+            self.connection._in_transaction = False
 
 
 def loader(engine: FakeEngine, *, batch_size: int = 2) -> TransactionIngestionLoader:
@@ -280,6 +292,183 @@ def load_archive(
         expected_count=expected_count,
         bulk_job=BULK_JOB,
     )
+
+
+def load_archive_with_connection(
+    subject: TransactionIngestionLoader,
+    connection: Any,
+    archive_path: Path,
+    *,
+    expected_count: int,
+    expected_archive_sha256: str | None = None,
+) -> Any:
+    return subject.load_with_connection(
+        connection,
+        archive_path=archive_path,
+        fiscal_year=FISCAL_YEAR,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        expected_count=expected_count,
+        bulk_job=BULK_JOB,
+        expected_archive_sha256=expected_archive_sha256,
+    )
+
+
+def test_load_remains_a_self_managed_transaction_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = write_archive(tmp_path, [transaction_row()], name="wrapper.zip")
+    engine = FakeEngine()
+    subject = loader(engine)
+    delegated_connections: list[FakeConnection] = []
+    real_load_with_connection = subject.load_with_connection
+
+    def recording_load_with_connection(
+        connection: Any,
+        **kwargs: Any,
+    ) -> Any:
+        assert connection.in_transaction()
+        delegated_connections.append(connection)
+        return real_load_with_connection(connection, **kwargs)
+
+    monkeypatch.setattr(
+        subject,
+        "load_with_connection",
+        recording_load_with_connection,
+    )
+
+    result = load_archive(subject, archive, expected_count=1)
+
+    assert result.loaded_rows == 1
+    assert delegated_connections == [engine.connection]
+    assert engine.commits == 1
+    assert engine.rollbacks == 0
+    assert not engine.connection.in_transaction()
+
+
+def test_connection_aware_load_rejects_non_postgresql_connection(
+    tmp_path: Path,
+) -> None:
+    archive = write_archive(tmp_path, [transaction_row()], name="sqlite.zip")
+    subject = loader(FakeEngine())
+    sqlite_engine = create_engine("sqlite+pysqlite:///:memory:")
+    try:
+        with sqlite_engine.begin() as connection:
+            with pytest.raises(
+                TransactionIngestionError,
+                match="postgresql_connection_required",
+            ):
+                load_archive_with_connection(
+                    subject,
+                    connection,
+                    archive,
+                    expected_count=1,
+                )
+    finally:
+        sqlite_engine.dispose()
+
+
+def test_connection_aware_load_requires_an_active_transaction(
+    tmp_path: Path,
+) -> None:
+    archive = write_archive(tmp_path, [transaction_row()], name="inactive.zip")
+    engine = FakeEngine()
+
+    with pytest.raises(TransactionIngestionError, match="active_transaction_required"):
+        load_archive_with_connection(
+            loader(engine),
+            engine.connection,
+            archive,
+            expected_count=1,
+        )
+
+    assert engine.connection.calls == []
+    assert engine.state.checkpoint is None
+    assert engine.state.transactions == {}
+
+
+def test_connection_aware_load_validates_hash_without_owning_transaction(
+    tmp_path: Path,
+) -> None:
+    archive = write_archive(tmp_path, [transaction_row()], name="expected-hash.zip")
+    expected_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+    engine = FakeEngine()
+    engine.connection._in_transaction = True
+
+    result = load_archive_with_connection(
+        loader(engine),
+        engine.connection,
+        archive,
+        expected_count=1,
+        expected_archive_sha256=expected_hash,
+    )
+
+    assert result.archive_sha256 == expected_hash
+    assert result.loaded_rows == 1
+    assert engine.connection.in_transaction()
+    assert engine.commits == 0
+    assert engine.rollbacks == 0
+
+
+@pytest.mark.parametrize(
+    "expected_hash",
+    [
+        "a" * 63,
+        "a" * 65,
+        "A" * 64,
+        ("a" * 63) + "g",
+        ("a" * 63) + " ",
+    ],
+)
+def test_connection_aware_load_rejects_malformed_expected_hash_without_mutation(
+    tmp_path: Path,
+    expected_hash: str,
+) -> None:
+    archive = write_archive(tmp_path, [transaction_row()], name="bad-hash.zip")
+    engine = FakeEngine()
+    engine.connection._in_transaction = True
+
+    with pytest.raises(
+        TransactionIngestionError,
+        match="invalid_expected_archive_sha256",
+    ):
+        load_archive_with_connection(
+            loader(engine),
+            engine.connection,
+            archive,
+            expected_count=1,
+            expected_archive_sha256=expected_hash,
+        )
+
+    assert engine.connection.calls == []
+    assert engine.state.checkpoint is None
+    assert engine.state.transactions == {}
+    assert engine.connection.in_transaction()
+    assert engine.commits == engine.rollbacks == 0
+
+
+def test_connection_aware_load_rejects_hash_mismatch_without_mutation(
+    tmp_path: Path,
+) -> None:
+    archive = write_archive(tmp_path, [transaction_row()], name="mismatch.zip")
+    engine = FakeEngine()
+    engine.connection._in_transaction = True
+
+    with pytest.raises(TransactionIngestionError, match="archive_sha256_mismatch"):
+        load_archive_with_connection(
+            loader(engine),
+            engine.connection,
+            archive,
+            expected_count=1,
+            expected_archive_sha256="0" * 64,
+        )
+
+    assert engine.connection.calls == []
+    assert engine.state.checkpoint is None
+    assert engine.state.transactions == {}
+    assert engine.connection.in_transaction()
+    assert engine.commits == engine.rollbacks == 0
 
 
 def test_first_load_maps_every_field_and_preserves_exact_signed_amounts(tmp_path: Path) -> None:
@@ -933,12 +1122,166 @@ def disposable_postgres_engine() -> Iterator[Any]:
         with scoped_engine.begin() as connection:
             UsaSpendingIngestionCheckpoint.__table__.create(connection)
             UsaSpendingTransaction.__table__.create(connection)
+            UsaSpendingTransactionIngestionAttempt.__table__.create(connection)
         yield scoped_engine
     finally:
         scoped_engine.dispose()
         with admin_engine.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         admin_engine.dispose()
+
+
+def loading_attempt_values(
+    archive_path: Path,
+    *,
+    attempt_id: UUID,
+) -> dict[str, Any]:
+    archive_bytes = archive_path.read_bytes()
+    return {
+        "id": attempt_id,
+        "source": "usaspending",
+        "fiscal_year": FISCAL_YEAR,
+        "period_start": PERIOD_START,
+        "period_end": PERIOD_END,
+        "status": "loading",
+        "expected_rows": 1,
+        "status_url": BULK_JOB.status_url,
+        "file_url": "https://files.usaspending.gov/transactions.zip",
+        "remote_file_name": BULK_JOB.file_name,
+        "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        "archive_bytes": len(archive_bytes),
+        "failure_count": 0,
+        "started_at": NOW,
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+
+
+@pytest.mark.integration
+def test_disposable_postgres_connection_load_and_attempt_complete_atomically(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = disposable_postgres_engine
+    archive = write_archive(
+        tmp_path,
+        [transaction_row(federal_action_obligation="-12.34")],
+        name="pg-atomic-complete.zip",
+    )
+    attempt_id = uuid4()
+    attempt_values = loading_attempt_values(archive, attempt_id=attempt_id)
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.insert(), attempt_values)
+
+    subject = TransactionIngestionLoader(engine, clock=lambda: NOW)
+    with engine.connect() as connection:
+        caller_transaction = connection.begin()
+        try:
+            result = load_archive_with_connection(
+                subject,
+                connection,
+                archive,
+                expected_count=1,
+                expected_archive_sha256=attempt_values["archive_sha256"],
+            )
+            assert connection.in_transaction()
+            assert connection.scalar(
+                text("SELECT to_regclass('pg_temp.usaspending_transaction_stage')")
+            ) is not None
+            connection.execute(
+                update(attempts)
+                .where(attempts.c.id == attempt_id)
+                .values(
+                    status="completed",
+                    loaded_rows=result.loaded_rows,
+                    signed_obligation_total=result.signed_obligation_total,
+                    checkpoint_id=result.checkpoint_id,
+                    completed_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            caller_transaction.commit()
+        except BaseException:
+            caller_transaction.rollback()
+            raise
+
+    with engine.connect() as connection:
+        completed = connection.execute(
+            select(attempts).where(attempts.c.id == attempt_id)
+        ).mappings().one()
+        assert completed["status"] == "completed"
+        assert completed["loaded_rows"] == 1
+        assert completed["signed_obligation_total"] == Decimal("-12.34")
+        assert completed["checkpoint_id"] == result.checkpoint_id
+        assert connection.scalar(
+            select(func.count()).select_from(UsaSpendingTransaction)
+        ) == 1
+        assert connection.scalar(
+            select(func.count()).select_from(UsaSpendingIngestionCheckpoint)
+        ) == 1
+        assert connection.scalar(
+            text("SELECT to_regclass('pg_temp.usaspending_transaction_stage')")
+        ) is None
+
+
+@pytest.mark.integration
+def test_disposable_postgres_caller_rollback_reverts_loader_and_attempt_changes(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = disposable_postgres_engine
+    archive = write_archive(
+        tmp_path,
+        [transaction_row(federal_action_obligation="45.67")],
+        name="pg-atomic-rollback.zip",
+    )
+    attempt_id = uuid4()
+    attempt_values = loading_attempt_values(archive, attempt_id=attempt_id)
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.insert(), attempt_values)
+
+    subject = TransactionIngestionLoader(engine, clock=lambda: NOW)
+    with engine.connect() as connection:
+        caller_transaction = connection.begin()
+        try:
+            connection.execute(
+                update(attempts)
+                .where(attempts.c.id == attempt_id)
+                .values(failure_count=1, updated_at=NOW)
+            )
+            load_archive_with_connection(
+                subject,
+                connection,
+                archive,
+                expected_count=1,
+                expected_archive_sha256=attempt_values["archive_sha256"],
+            )
+            assert connection.scalar(
+                select(func.count()).select_from(UsaSpendingTransaction)
+            ) == 1
+            raise RuntimeError("attempt completion failed")
+        except RuntimeError as error:
+            assert str(error) == "attempt completion failed"
+            caller_transaction.rollback()
+
+    with engine.connect() as connection:
+        attempt = connection.execute(
+            select(attempts).where(attempts.c.id == attempt_id)
+        ).mappings().one()
+        assert attempt["status"] == "loading"
+        assert attempt["failure_count"] == 0
+        assert attempt["checkpoint_id"] is None
+        assert connection.scalar(
+            select(func.count()).select_from(UsaSpendingTransaction)
+        ) == 0
+        assert connection.scalar(
+            select(func.count()).select_from(UsaSpendingIngestionCheckpoint)
+        ) == 0
+        assert connection.scalar(
+            text("SELECT to_regclass('pg_temp.usaspending_transaction_stage')")
+        ) is None
 
 
 @pytest.mark.integration
