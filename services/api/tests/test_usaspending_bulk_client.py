@@ -86,6 +86,8 @@ def completed_status(*, file_url: str | None = None) -> BulkExportStatus:
         status_url=job().status_url,
         file_url=file_url or job().file_url,
         file_name="x.zip",
+        total_rows=1,
+        total_columns=16,
         message=None,
         seconds_elapsed="5.0",
     )
@@ -258,6 +260,8 @@ def test_polling_moves_from_pending_to_complete_and_respects_numeric_retry_after
                     "status": "finished",
                     "file_url": job().file_url,
                     "file_name": "x.zip",
+                    "total_rows": 490381,
+                    "total_columns": 16,
                     "message": None,
                     "seconds_elapsed": "12.0",
                 },
@@ -285,6 +289,8 @@ def test_polling_moves_from_pending_to_complete_and_respects_numeric_retry_after
 
     assert completed.status == "finished"
     assert completed.file_url == job().file_url
+    assert completed.total_rows == 490381
+    assert completed.total_columns == 16
     assert completed.seconds_elapsed == "12.0"
     assert sleeps == [12.0]
 
@@ -302,7 +308,11 @@ def test_polling_respects_http_date_retry_after_beyond_backoff_cap(
             ),
             httpx.Response(
                 200,
-                json={"status": "finished", "file_url": job().file_url},
+                json={
+                    "status": "finished",
+                    "file_url": job().file_url,
+                    "total_rows": 1,
+                },
             ),
         ]
     )
@@ -368,6 +378,108 @@ def test_polling_rejects_malformed_status(monkeypatch: pytest.MonkeyPatch) -> No
 
     with pytest.raises(UsaSpendingError, match="invalid_bulk_export_status"):
         run(client.poll_bulk_export(job()))
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"total_rows": -1},
+        {"total_rows": True},
+        {"total_rows": "490381"},
+        {"total_rows": 500001},
+    ],
+)
+def test_polling_rejects_invalid_total_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[str, object],
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "finished",
+                "file_url": job().file_url,
+                **metadata,
+            },
+        )
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="invalid_bulk_export_total_rows"):
+        run(client.poll_bulk_export(job()))
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({}, None),
+        ({"total_columns": 16}, 16),
+    ],
+)
+def test_polling_accepts_optional_strict_total_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[str, object],
+    expected: int | None,
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "finished",
+                "file_url": job().file_url,
+                "total_rows": 490381,
+                **metadata,
+            },
+        )
+
+    client = async_client_with_transport(monkeypatch, handler)
+    completed = run(client.poll_bulk_export(job()))
+
+    assert completed.total_columns == expected
+
+
+@pytest.mark.parametrize("total_columns", [True, "16", 15, 17])
+def test_polling_rejects_invalid_total_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    total_columns: object,
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "finished",
+                "file_url": job().file_url,
+                "total_rows": 490381,
+                "total_columns": total_columns,
+            },
+        )
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="invalid_bulk_export_total_columns"):
+        run(client.poll_bulk_export(job()))
+
+
+def test_polling_does_not_infer_counts_from_total_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "finished",
+                "file_url": job().file_url,
+                "total_rows": 490381,
+                "total_size": "not-a-count",
+            },
+        )
+
+    client = async_client_with_transport(monkeypatch, handler)
+    completed = run(client.poll_bulk_export(job()))
+
+    assert completed.total_rows == 490381
+    assert completed.total_columns is None
 
 
 def test_submission_rejects_malformed_job(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -560,6 +672,7 @@ def test_same_host_relative_status_redirect_is_followed(
                 "status": "finished",
                 "file_url": job().file_url,
                 "file_name": "redirected.zip",
+                "total_rows": 1,
             },
         )
 

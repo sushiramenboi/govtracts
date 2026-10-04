@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.models import (
     UsaSpendingIngestionCheckpoint,
@@ -97,12 +98,18 @@ class StubClient:
         submit_error: UsaSpendingError | None = None,
         poll_error: UsaSpendingError | None = None,
         download_error: UsaSpendingError | None = None,
+        pre_submission_rows: int = 1,
+        export_rows: int = 1,
+        export_columns: int | None = 16,
     ) -> None:
         self.archive = archive
         self.count_error = count_error
         self.submit_error = submit_error
         self.poll_error = poll_error
         self.download_error = download_error
+        self.pre_submission_rows = pre_submission_rows
+        self.export_rows = export_rows
+        self.export_columns = export_columns
         self.count_calls = 0
         self.submit_calls = 0
         self.poll_calls = 0
@@ -116,7 +123,7 @@ class StubClient:
             self.count_calls += 1
         if self.count_error is not None:
             raise self.count_error
-        return 1
+        return self.pre_submission_rows
 
     def submit_bulk_export(self, start: date, end: date) -> BulkExportJob:
         assert (start, end) == (PERIOD_START, PERIOD_END)
@@ -141,6 +148,8 @@ class StubClient:
             status_url=job.status_url,
             file_url=job.file_url,
             file_name=job.file_name,
+            total_rows=self.export_rows,
+            total_columns=self.export_columns,
             message=None,
             seconds_elapsed="1.0",
         )
@@ -152,6 +161,8 @@ class StubClient:
         **_: Any,
     ) -> int:
         assert completed.status == "finished"
+        assert completed.total_rows == self.export_rows
+        assert completed.total_columns == self.export_columns
         with self._lock:
             self.download_calls += 1
         destination_path = Path(destination)
@@ -204,6 +215,48 @@ class TrackingTemporaryDirectories:
 class ExplodingLoader:
     def load_with_connection(self, *_: Any, **__: Any) -> TransactionIngestionResult:
         raise AssertionError("loader must not be called")
+
+
+class RecordingLoader:
+    def __init__(self, *, loaded_rows: int) -> None:
+        self.loaded_rows = loaded_rows
+        self.expected_counts: list[int] = []
+
+    def load_with_connection(
+        self,
+        connection: Any,
+        *,
+        expected_count: int,
+        expected_archive_sha256: str,
+        **_: Any,
+    ) -> TransactionIngestionResult:
+        self.expected_counts.append(expected_count)
+        checkpoint_id = uuid4()
+        connection.execute(
+            UsaSpendingIngestionCheckpoint.__table__.insert(),
+            {
+                "id": checkpoint_id,
+                "source": "usaspending",
+                "fiscal_year": FISCAL_YEAR,
+                "period_start": PERIOD_START,
+                "period_end": PERIOD_END,
+                "status": "complete",
+                "archive_sha256": expected_archive_sha256,
+                "expected_rows": expected_count,
+                "loaded_rows": self.loaded_rows,
+                "started_at": NOW,
+                "completed_at": NOW,
+                "created_at": NOW,
+                "updated_at": NOW,
+            },
+        )
+        return TransactionIngestionResult(
+            checkpoint_id=checkpoint_id,
+            archive_sha256=expected_archive_sha256,
+            loaded_rows=self.loaded_rows,
+            signed_obligation_total=Decimal("-12.34"),
+            no_op=False,
+        )
 
 
 def test_invalid_fiscal_period_fails_before_database_or_network() -> None:
@@ -312,6 +365,8 @@ def attempt_values(
             file_url=file_url,
             remote_file_name=REMOTE_FILE_NAME,
         )
+    if status in {"export_finished", "archive_hashed", "loading", "completed"}:
+        values.update(export_rows=1, export_columns=16)
     if status in {"archive_hashed", "loading", "completed"}:
         assert archive is not None
         values.update(
@@ -404,7 +459,8 @@ def test_complete_workflow_uses_all_valid_transitions_and_safe_temporary_path(
     result = run_period(workflow(engine, client, directories))
 
     assert result.status == "completed"
-    assert result.expected_rows == result.loaded_rows == 1
+    assert result.pre_submission_rows == result.export_rows == result.loaded_rows == 1
+    assert result.count_drift == 0
     assert result.signed_obligation_total == Decimal("-12.34")
     assert result.checkpoint_id is not None
     assert (
@@ -434,6 +490,94 @@ def test_complete_workflow_uses_all_valid_transitions_and_safe_temporary_path(
             "usaspending_transactions",
             "usaspending_transaction_ingestion_attempts",
         }
+
+
+@pytest.mark.integration
+def test_export_bound_count_drives_loader_checkpoint_and_completion(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = disposable_postgres_engine
+    archive = archive_bytes()
+    client = StubClient(
+        archive=archive,
+        pre_submission_rows=490382,
+        export_rows=490381,
+    )
+    loader = RecordingLoader(loaded_rows=490381)
+
+    result = run_period(
+        workflow(
+            engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+            loader=loader,
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.pre_submission_rows == 490382
+    assert result.export_rows == result.loaded_rows == 490381
+    assert result.count_drift == -1
+    assert loader.expected_counts == [490381]
+    with engine.connect() as connection:
+        attempt = connection.execute(
+            select(UsaSpendingTransactionIngestionAttempt)
+        ).mappings().one()
+        checkpoint = connection.execute(
+            select(UsaSpendingIngestionCheckpoint)
+        ).mappings().one()
+    assert attempt["expected_rows"] == 490382
+    assert attempt["export_rows"] == attempt["loaded_rows"] == 490381
+    assert attempt["export_columns"] == 16
+    assert checkpoint["expected_rows"] == checkpoint["loaded_rows"] == 490381
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("loaded_rows", [490380, 490382])
+def test_loader_count_mismatch_against_export_rolls_back_atomically(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+    loaded_rows: int,
+) -> None:
+    engine = disposable_postgres_engine
+    archive = archive_bytes()
+    client = StubClient(
+        archive=archive,
+        pre_submission_rows=490382,
+        export_rows=490381,
+    )
+    loader = RecordingLoader(loaded_rows=loaded_rows)
+
+    result = run_period(
+        workflow(
+            engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+            loader=loader,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "loaded_row_count_mismatch"
+    assert result.pre_submission_rows == 490382
+    assert result.export_rows == 490381
+    assert result.loaded_rows is None
+    assert result.count_drift == -1
+    assert loader.expected_counts == [490381]
+    with engine.connect() as connection:
+        assert connection.scalar(
+            select(func.count()).select_from(UsaSpendingTransaction)
+        ) == 0
+        assert connection.scalar(
+            select(func.count()).select_from(UsaSpendingIngestionCheckpoint)
+        ) == 0
+        attempt = connection.execute(
+            select(UsaSpendingTransactionIngestionAttempt)
+        ).mappings().one()
+    assert attempt["status"] == "failed"
+    assert attempt["checkpoint_id"] is None
+    assert attempt["loaded_rows"] is None
 
 
 @pytest.mark.integration
@@ -642,6 +786,88 @@ def test_transient_poll_failure_retains_submitted_state(
         assert connection.scalar(
             select(UsaSpendingTransactionIngestionAttempt.failure_count)
         ) == 1
+
+
+@pytest.mark.integration
+def test_terminal_metadata_transition_failure_remains_submitted(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = disposable_postgres_engine
+    seed_attempt(engine, "submitted")
+    client = StubClient(archive=archive_bytes(), export_rows=490381)
+    subject = workflow(
+        engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+        loader=ExplodingLoader(),
+    )
+    original_transition = subject._transition
+
+    def fail_export_finished_transition(
+        attempt: dict[str, Any],
+        *,
+        expected_status: str,
+        next_status: str,
+        values: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        if expected_status == "submitted" and next_status == "export_finished":
+            raise SQLAlchemyError("injected transition failure")
+        return original_transition(
+            attempt,
+            expected_status=expected_status,
+            next_status=next_status,
+            values=values,
+        )
+
+    monkeypatch.setattr(subject, "_transition", fail_export_finished_transition)
+
+    result = run_period(subject)
+
+    assert result.status == "submitted"
+    assert result.export_rows is None
+    assert result.error_code == "database_operation_failed"
+    assert client.poll_calls == 1
+    assert client.download_calls == 0
+    with engine.connect() as connection:
+        attempt = connection.execute(
+            select(UsaSpendingTransactionIngestionAttempt)
+        ).mappings().one()
+    assert attempt["status"] == "submitted"
+    assert attempt["export_rows"] is None
+    assert attempt["export_columns"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "error_code",
+    ["invalid_bulk_export_total_rows", "invalid_bulk_export_total_columns"],
+)
+def test_invalid_terminal_count_metadata_fails_before_download(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    engine = disposable_postgres_engine
+    seed_attempt(engine, "submitted")
+    client = StubClient(
+        archive=archive_bytes(),
+        poll_error=UsaSpendingError(error_code),
+    )
+
+    result = run_period(
+        workflow(
+            engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+            loader=ExplodingLoader(),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == error_code
+    assert client.download_calls == 0
 
 
 @pytest.mark.integration

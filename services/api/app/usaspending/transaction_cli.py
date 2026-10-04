@@ -187,12 +187,31 @@ def _safe_result(result: TransactionWorkflowResult) -> dict[str, object]:
         Decimal,
     ):
         raise TransactionWorkflowError("invalid_workflow_result")
+    counts = (
+        result.pre_submission_rows,
+        result.export_rows,
+        result.loaded_rows,
+        result.count_drift,
+    )
+    if any(
+        value is not None
+        and (not isinstance(value, int) or isinstance(value, bool))
+        for value in counts
+    ):
+        raise TransactionWorkflowError("invalid_workflow_result")
+    if result.pre_submission_rows is None or result.export_rows is None:
+        if result.count_drift is not None:
+            raise TransactionWorkflowError("invalid_workflow_result")
+    elif result.count_drift != result.export_rows - result.pre_submission_rows:
+        raise TransactionWorkflowError("invalid_workflow_result")
 
     return {
         "attempt_id": str(result.attempt_id),
         "status": result.status,
-        "expected_rows": result.expected_rows,
+        "pre_submission_rows": result.pre_submission_rows,
+        "export_rows": result.export_rows,
         "loaded_rows": result.loaded_rows,
+        "count_drift": result.count_drift,
         "signed_obligation_total": (
             str(result.signed_obligation_total)
             if result.signed_obligation_total is not None

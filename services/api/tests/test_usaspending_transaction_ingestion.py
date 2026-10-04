@@ -1145,6 +1145,8 @@ def loading_attempt_values(
         "period_end": PERIOD_END,
         "status": "loading",
         "expected_rows": 1,
+        "export_rows": 1,
+        "export_columns": 16,
         "status_url": BULK_JOB.status_url,
         "file_url": "https://files.usaspending.gov/transactions.zip",
         "remote_file_name": BULK_JOB.file_name,

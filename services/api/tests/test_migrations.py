@@ -13,11 +13,11 @@ from app.core.config import load_settings
 API_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_initial_migration_is_the_only_head_revision() -> None:
+def test_export_bound_count_migration_is_the_only_head_revision() -> None:
     config = Config(str(API_ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260927_0004"]
+    assert script.get_heads() == ["20261003_0005"]
 
 
 @pytest.mark.integration

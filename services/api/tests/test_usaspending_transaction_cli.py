@@ -5,6 +5,7 @@ import asyncio
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
 from typing import Any
@@ -43,17 +44,20 @@ def result(
     error_code: str | None = None,
     operator_resolution_required: bool = False,
 ) -> TransactionWorkflowResult:
+    completed = status == "completed"
     return TransactionWorkflowResult(
         attempt_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
         status=status,
-        expected_rows=1,
-        loaded_rows=1 if status == "completed" else None,
+        pre_submission_rows=490_382,
+        export_rows=490_381 if completed else None,
+        loaded_rows=490_381 if completed else None,
+        count_drift=-1 if completed else None,
         signed_obligation_total=(
-            Decimal("-12.34") if status == "completed" else None
+            Decimal("-12.34") if completed else None
         ),
         checkpoint_id=(
             UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-            if status == "completed"
+            if completed
             else None
         ),
         error_code=error_code,
@@ -209,8 +213,10 @@ def test_completed_result_uses_safe_fields_and_success_exit() -> None:
     assert payload == {
         "attempt_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "status": "completed",
-        "expected_rows": 1,
-        "loaded_rows": 1,
+        "pre_submission_rows": 490_382,
+        "export_rows": 490_381,
+        "loaded_rows": 490_381,
+        "count_drift": -1,
         "signed_obligation_total": "-12.34",
         "checkpoint_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
         "error_code": None,
@@ -239,6 +245,55 @@ def test_failed_result_uses_nonzero_exit() -> None:
     assert payload["status"] == "failed"
     assert payload["error_code"] == "transaction_validation_failed"
     assert errors == ""
+    assert tracker.entered == tracker.closed == 1
+
+
+def test_historical_failed_result_uses_null_export_values() -> None:
+    exit_code, payload, errors, tracker = invoke(
+        result("failed", error_code="transaction_validation_failed")
+    )
+
+    assert exit_code == EXIT_FAILED
+    assert payload["pre_submission_rows"] == 490_382
+    assert payload["export_rows"] is None
+    assert payload["loaded_rows"] is None
+    assert payload["count_drift"] is None
+    assert errors == ""
+    assert tracker.entered == tracker.closed == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pre_submission_rows", True),
+        ("export_rows", "490381"),
+        ("loaded_rows", False),
+        ("count_drift", "-1"),
+        ("count_drift", 0),
+    ],
+)
+def test_invalid_count_shapes_are_rejected_without_echoing(
+    field: str,
+    value: object,
+) -> None:
+    invalid = replace(result("completed"), **{field: value})
+    tracker = RuntimeTracker(FakeWorkflow(invalid))
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = main(
+        VALID_ARGS,
+        runtime_factory=tracker.factory,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == EXIT_OPERATION_FAILED
+    assert stdout.getvalue() == ""
+    assert json.loads(stderr.getvalue()) == {
+        "error_code": "invalid_workflow_result"
+    }
+    assert str(value) not in stderr.getvalue()
     assert tracker.entered == tracker.closed == 1
 
 

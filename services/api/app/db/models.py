@@ -214,6 +214,8 @@ class UsaSpendingTransactionIngestionAttempt(Base):
         CheckConstraint("fiscal_year BETWEEN 2000 AND 9999", name="fiscal_year_range"),
         CheckConstraint(
             "(expected_rows IS NULL OR expected_rows >= 0) AND "
+            "(export_rows IS NULL OR export_rows BETWEEN 0 AND 500000) AND "
+            "(export_columns IS NULL OR export_columns = 16) AND "
             "(archive_bytes IS NULL OR archive_bytes >= 0) AND "
             "(loaded_rows IS NULL OR loaded_rows >= 0) AND failure_count >= 0",
             name="counts_nonneg",
@@ -223,6 +225,11 @@ class UsaSpendingTransactionIngestionAttempt(Base):
             "'export_finished', 'archive_hashed', 'loading', 'completed', "
             "'submission_unknown') OR expected_rows IS NOT NULL",
             name="count_metadata",
+        ),
+        CheckConstraint(
+            "status NOT IN ('export_finished', 'archive_hashed', 'loading', "
+            "'completed') OR export_rows IS NOT NULL",
+            name="export_metadata",
         ),
         CheckConstraint(
             "archive_sha256 IS NULL OR ("
@@ -251,7 +258,8 @@ class UsaSpendingTransactionIngestionAttempt(Base):
             "((status IN ('completed', 'failed')) = (completed_at IS NOT NULL)) AND "
             "(status != 'completed' OR "
             "(checkpoint_id IS NOT NULL AND expected_rows IS NOT NULL "
-            "AND loaded_rows IS NOT NULL AND expected_rows = loaded_rows "
+            "AND export_rows IS NOT NULL AND loaded_rows IS NOT NULL "
+            "AND export_rows = loaded_rows "
             "AND signed_obligation_total IS NOT NULL))",
             name="terminal_fields",
         ),
@@ -285,6 +293,8 @@ class UsaSpendingTransactionIngestionAttempt(Base):
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     expected_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    export_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    export_columns: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     status_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     file_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     remote_file_name: Mapped[str | None] = mapped_column(String(512), nullable=True)

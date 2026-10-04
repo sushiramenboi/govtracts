@@ -73,6 +73,8 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "period_end",
         "status",
         "expected_rows",
+        "export_rows",
+        "export_columns",
         "status_url",
         "file_url",
         "remote_file_name",
@@ -122,6 +124,7 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "ck_usaspending_transaction_ingestion_attempts_count_metadata",
         "ck_usaspending_transaction_ingestion_attempts_counts_nonneg",
         "ck_usaspending_transaction_ingestion_attempts_error_metadata",
+        "ck_usaspending_transaction_ingestion_attempts_export_metadata",
         "ck_usaspending_transaction_ingestion_attempts_fiscal_year_range",
         "ck_usaspending_transaction_ingestion_attempts_hash_lower_hex",
         "ck_usaspending_transaction_ingestion_attempts_job_metadata",
@@ -151,6 +154,8 @@ def test_only_one_nonterminal_attempt_can_exist_for_a_period() -> None:
                 .values(
                     status="completed",
                     expected_rows=1,
+                    export_rows=1,
+                    export_columns=16,
                     status_url="https://api.usaspending.gov/status/1",
                     file_url="https://files.usaspending.gov/export.zip",
                     remote_file_name="export.zip",
@@ -191,6 +196,9 @@ def test_only_one_nonterminal_attempt_can_exist_for_a_period() -> None:
         {"status": "unknown"},
         {"period_end": date(2024, 9, 30)},
         {"expected_rows": -1},
+        {"export_rows": -1},
+        {"export_rows": 500001},
+        {"export_columns": 15},
         {"archive_sha256": "short"},
         {"archive_sha256": "A" * 64},
         {"archive_sha256": "a" * 32 + "A" * 32},
@@ -199,7 +207,22 @@ def test_only_one_nonterminal_attempt_can_exist_for_a_period() -> None:
         {"archive_sha256": "g" * 64},
         {"status": "counted"},
         {"status": "submitted"},
-        {"status": "archive_hashed", "archive_sha256": "a" * 64},
+        {
+            "status": "export_finished",
+            "expected_rows": 1,
+            "status_url": "https://api.usaspending.gov/status/1",
+            "file_url": "https://files.usaspending.gov/export.zip",
+            "remote_file_name": "export.zip",
+        },
+        {
+            "status": "archive_hashed",
+            "expected_rows": 1,
+            "status_url": "https://api.usaspending.gov/status/1",
+            "file_url": "https://files.usaspending.gov/export.zip",
+            "remote_file_name": "export.zip",
+            "archive_sha256": "a" * 64,
+            "archive_bytes": 123,
+        },
         {"status": "failed", "completed_at": NOW},
         {"status": "submission_unknown"},
     ],
@@ -217,30 +240,80 @@ def test_attempt_checks_reject_inconsistent_state(
         engine.dispose()
 
 
-def test_completed_attempt_requires_matching_expected_and_loaded_counts() -> None:
+def test_completed_attempt_uses_export_count_and_allows_pre_count_drift() -> None:
     engine = _database()
     table = models.UsaSpendingTransactionIngestionAttempt.__table__
     try:
         with engine.begin() as connection:
             checkpoint_id = _checkpoint(connection)
 
+        completed = _attempt_values(
+            status="completed",
+            expected_rows=490382,
+            export_rows=490381,
+            export_columns=16,
+            status_url="https://api.usaspending.gov/status/1",
+            file_url="https://files.usaspending.gov/export.zip",
+            remote_file_name="export.zip",
+            archive_sha256="0123456789abcdef" * 4,
+            archive_bytes=123,
+            loaded_rows=490381,
+            signed_obligation_total=Decimal("10.25"),
+            checkpoint_id=checkpoint_id,
+            completed_at=NOW,
+        )
+        with engine.begin() as connection:
+            connection.execute(table.insert(), completed)
+
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
                     table.insert(),
                     _attempt_values(
-                        status="completed",
-                        expected_rows=2,
-                        status_url="https://api.usaspending.gov/status/1",
-                        file_url="https://files.usaspending.gov/export.zip",
-                        remote_file_name="export.zip",
-                        archive_sha256="0123456789abcdef" * 4,
-                        archive_bytes=123,
-                        loaded_rows=1,
-                        signed_obligation_total=Decimal("10.25"),
-                        checkpoint_id=checkpoint_id,
-                        completed_at=NOW,
+                        **{
+                            **completed,
+                            "id": uuid4(),
+                            "loaded_rows": 490380,
+                        }
                     ),
                 )
+
+        with engine.connect() as connection:
+            row = connection.execute(
+                select(
+                    table.c.expected_rows,
+                    table.c.export_rows,
+                    table.c.loaded_rows,
+                ).where(table.c.id == completed["id"])
+            ).one()
+        assert row == (490382, 490381, 490381)
+    finally:
+        engine.dispose()
+
+
+def test_historical_failed_attempt_accepts_null_export_metadata() -> None:
+    engine = _database()
+    table = models.UsaSpendingTransactionIngestionAttempt.__table__
+    try:
+        failed = _attempt_values(
+            status="failed",
+            expected_rows=490382,
+            status_url="https://api.usaspending.gov/status/1",
+            file_url="https://files.usaspending.gov/export.zip",
+            remote_file_name="export.zip",
+            archive_sha256="0123456789abcdef" * 4,
+            archive_bytes=123,
+            last_error_code="transaction_count_mismatch",
+            completed_at=NOW,
+        )
+        with engine.begin() as connection:
+            connection.execute(table.insert(), failed)
+        with engine.connect() as connection:
+            row = connection.execute(
+                select(table.c.status, table.c.export_rows, table.c.export_columns).where(
+                    table.c.id == failed["id"]
+                )
+            ).one()
+        assert row == ("failed", None, None)
     finally:
         engine.dispose()

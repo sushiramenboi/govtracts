@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.core.config import Settings
+from app.usaspending.transaction_export import DEFAULT_MAX_ROWS
 
 
 API_HOST = "api.usaspending.gov"
@@ -89,6 +90,8 @@ class BulkExportStatus:
     status_url: str
     file_url: str
     file_name: str
+    total_rows: int
+    total_columns: int | None
     message: str | None
     seconds_elapsed: str | None
 
@@ -225,12 +228,27 @@ class UsaSpendingClient:
                     if status == "finished":
                         file_url = payload.get("file_url") or job.file_url
                         file_name = payload.get("file_name") or job.file_name
+                        total_rows = payload.get("total_rows")
+                        total_columns = payload.get("total_columns")
                         message = payload.get("message")
                         seconds_elapsed = payload.get("seconds_elapsed")
                         if not isinstance(file_url, str) or not file_url:
                             raise UsaSpendingError("invalid_bulk_export_status")
                         if not isinstance(file_name, str) or not file_name:
                             raise UsaSpendingError("invalid_bulk_export_status")
+                        if (
+                            isinstance(total_rows, bool)
+                            or not isinstance(total_rows, int)
+                            or total_rows < 0
+                            or total_rows > DEFAULT_MAX_ROWS
+                        ):
+                            raise UsaSpendingError("invalid_bulk_export_total_rows")
+                        if total_columns is not None and (
+                            isinstance(total_columns, bool)
+                            or not isinstance(total_columns, int)
+                            or total_columns != len(BULK_TRANSACTION_FIELDS)
+                        ):
+                            raise UsaSpendingError("invalid_bulk_export_total_columns")
                         if message is not None and not isinstance(message, str):
                             raise UsaSpendingError("invalid_bulk_export_status")
                         if seconds_elapsed is not None and not isinstance(seconds_elapsed, str):
@@ -241,6 +259,8 @@ class UsaSpendingClient:
                             status_url=job.status_url,
                             file_url=file_url,
                             file_name=file_name,
+                            total_rows=total_rows,
+                            total_columns=total_columns,
                             message=message,
                             seconds_elapsed=seconds_elapsed,
                         )

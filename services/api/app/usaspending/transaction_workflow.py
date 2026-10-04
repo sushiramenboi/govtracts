@@ -21,13 +21,14 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.db.models import UsaSpendingTransactionIngestionAttempt
 from app.usaspending.client import (
+    BULK_TRANSACTION_FIELDS,
     BulkExportJob,
     BulkExportStatus,
     UsaSpendingClient,
     UsaSpendingError,
 )
 from app.usaspending.fiscal_years import fiscal_month_bounds
-from app.usaspending.transaction_export import TransactionExportError
+from app.usaspending.transaction_export import DEFAULT_MAX_ROWS, TransactionExportError
 from app.usaspending.transaction_ingestion import (
     BulkJobMetadata,
     TransactionIngestionError,
@@ -55,6 +56,8 @@ DETERMINISTIC_UPSTREAM_ERRORS = frozenset(
         "bulk_export_failed",
         "bulk_export_rejected",
         "invalid_bulk_export_status",
+        "invalid_bulk_export_total_rows",
+        "invalid_bulk_export_total_columns",
         "bulk_export_not_finished",
         "invalid_content_length",
         "bulk_export_archive_too_large",
@@ -85,8 +88,10 @@ class TransactionWorkflowResult:
 
     attempt_id: UUID
     status: str
-    expected_rows: int | None
+    pre_submission_rows: int | None
+    export_rows: int | None
     loaded_rows: int | None
+    count_drift: int | None
     signed_obligation_total: Decimal | None
     checkpoint_id: UUID | None
     error_code: str | None
@@ -289,6 +294,8 @@ class TransactionIngestionWorkflow:
                             "status_url": completed.status_url,
                             "file_url": completed.file_url,
                             "remote_file_name": completed.file_name,
+                            "export_rows": completed.total_rows,
+                            "export_columns": completed.total_columns,
                             "last_error_code": None,
                             "last_error_detail": None,
                         },
@@ -722,13 +729,18 @@ class TransactionIngestionWorkflow:
                 fiscal_year=fiscal_year,
                 period_start=period_start,
                 period_end=period_end,
-                expected_count=attempt["expected_rows"],
+                expected_count=attempt["export_rows"],
                 bulk_job=BulkJobMetadata(
                     status_url=attempt["status_url"],
                     file_name=attempt["remote_file_name"],
                 ),
                 expected_archive_sha256=attempt["archive_sha256"],
             )
+            if result.loaded_rows != attempt["export_rows"]:
+                raise _DeterministicFailure(
+                    "loaded_row_count_mismatch",
+                    "Loaded rows differ from the persisted export count.",
+                )
             self._complete_attempt(connection, attempt_id, result)
             return result
 
@@ -778,7 +790,20 @@ class TransactionIngestionWorkflow:
             or attempt["period_start"] != period_start
             or attempt["period_end"] != period_end
             or not isinstance(attempt["expected_rows"], int)
+            or isinstance(attempt["expected_rows"], bool)
             or attempt["expected_rows"] < 0
+            or not isinstance(attempt["export_rows"], int)
+            or isinstance(attempt["export_rows"], bool)
+            or attempt["export_rows"] < 0
+            or attempt["export_rows"] > DEFAULT_MAX_ROWS
+            or (
+                attempt.get("export_columns") is not None
+                and (
+                    not isinstance(attempt["export_columns"], int)
+                    or isinstance(attempt["export_columns"], bool)
+                    or attempt["export_columns"] != len(BULK_TRANSACTION_FIELDS)
+                )
+            )
             or not _present_string(attempt["status_url"])
             or not _present_string(attempt["file_url"])
             or not _present_string(attempt["remote_file_name"])
@@ -832,11 +857,34 @@ class TransactionIngestionWorkflow:
         attempt: Mapping[str, Any],
     ) -> BulkExportStatus:
         job = TransactionIngestionWorkflow._job_from_attempt(attempt)
+        total_rows = attempt.get("export_rows")
+        total_columns = attempt.get("export_columns")
+        if (
+            not isinstance(total_rows, int)
+            or isinstance(total_rows, bool)
+            or total_rows < 0
+            or total_rows > DEFAULT_MAX_ROWS
+        ):
+            raise _DeterministicFailure(
+                "invalid_persisted_export_rows",
+                "Persisted export row metadata is invalid.",
+            )
+        if total_columns is not None and (
+            not isinstance(total_columns, int)
+            or isinstance(total_columns, bool)
+            or total_columns != len(BULK_TRANSACTION_FIELDS)
+        ):
+            raise _DeterministicFailure(
+                "invalid_persisted_export_columns",
+                "Persisted export column metadata is invalid.",
+            )
         return BulkExportStatus(
             status="finished",
             status_url=job.status_url,
             file_url=job.file_url,
             file_name=job.file_name,
+            total_rows=total_rows,
+            total_columns=total_columns,
             message=None,
             seconds_elapsed=None,
         )
@@ -866,11 +914,23 @@ class TransactionIngestionWorkflow:
 
     @staticmethod
     def _result(attempt: Mapping[str, Any]) -> TransactionWorkflowResult:
+        pre_submission_rows = attempt.get("expected_rows")
+        export_rows = attempt.get("export_rows")
+        count_drift = (
+            export_rows - pre_submission_rows
+            if isinstance(pre_submission_rows, int)
+            and not isinstance(pre_submission_rows, bool)
+            and isinstance(export_rows, int)
+            and not isinstance(export_rows, bool)
+            else None
+        )
         return TransactionWorkflowResult(
             attempt_id=attempt["id"],
             status=attempt["status"],
-            expected_rows=attempt.get("expected_rows"),
+            pre_submission_rows=pre_submission_rows,
+            export_rows=export_rows,
             loaded_rows=attempt.get("loaded_rows"),
+            count_drift=count_drift,
             signed_obligation_total=attempt.get("signed_obligation_total"),
             checkpoint_id=attempt.get("checkpoint_id"),
             error_code=attempt.get("last_error_code"),
