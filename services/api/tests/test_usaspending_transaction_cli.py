@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from app.usaspending import transaction_cli
 from app.usaspending.transaction_cli import (
     EXIT_COMPLETED,
     EXIT_FAILED,
@@ -352,6 +353,71 @@ def test_runtime_is_closed_after_workflow_failure() -> None:
 
     assert exit_code == EXIT_OPERATION_FAILED
     assert tracker.entered == tracker.closed == 1
+
+
+def test_live_runtime_holds_shared_lease_around_client_and_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    lease_held = False
+
+    class FakeDatabase:
+        def __init__(self, _settings: object) -> None:
+            self.engine = object()
+            events.append("database")
+
+        def dispose(self) -> None:
+            events.append("dispose")
+
+    @contextmanager
+    def fake_lease(_engine: object) -> Iterator[None]:
+        nonlocal lease_held
+        lease_held = True
+        events.append("lease_enter")
+        try:
+            yield
+        finally:
+            lease_held = False
+            events.append("lease_exit")
+
+    class Constructed:
+        def __init__(self, name: str) -> None:
+            assert lease_held is True
+            events.append(name)
+
+    monkeypatch.setattr(transaction_cli, "load_settings", lambda: object())
+    monkeypatch.setattr(transaction_cli, "Database", FakeDatabase)
+    monkeypatch.setattr(transaction_cli, "global_ingestion_lease", fake_lease)
+    monkeypatch.setattr(
+        transaction_cli,
+        "UsaSpendingClient",
+        lambda _settings: Constructed("client"),
+    )
+    monkeypatch.setattr(
+        transaction_cli,
+        "TransactionIngestionLoader",
+        lambda _engine: Constructed("loader"),
+    )
+    monkeypatch.setattr(
+        transaction_cli,
+        "TransactionIngestionWorkflow",
+        lambda _engine, _client, _loader: Constructed("workflow"),
+    )
+
+    with transaction_cli._live_runtime():
+        assert lease_held is True
+        events.append("yield")
+
+    assert events == [
+        "database",
+        "lease_enter",
+        "client",
+        "loader",
+        "workflow",
+        "yield",
+        "lease_exit",
+        "dispose",
+    ]
 
 
 def test_cancellation_propagates_after_runtime_cleanup() -> None:

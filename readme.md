@@ -97,6 +97,8 @@ Set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000` in `apps/web/.env.local` fo
 
 ## Tests and checks
 
+The controlled transaction-backfill planner and the separately reviewed live-acceptance procedure are documented in [the USAspending transaction backfill runbook](docs/runbooks/usaspending-transaction-backfill.md). The planner is dry-run by default; do not start live ingestion without the runbook's independent approval, backup, migration, pilot-integrity, capacity, and finite-bound gates.
+
 Backend checks:
 
 ```sh

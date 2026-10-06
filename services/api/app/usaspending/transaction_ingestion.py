@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import stat
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
@@ -35,7 +36,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Connection
 
 from app.db.models import UsaSpendingIngestionCheckpoint, UsaSpendingTransaction
-from app.usaspending.fiscal_years import fiscal_month_bounds
+from app.usaspending.fiscal_years import validate_subperiod
 from app.usaspending.transaction_export import (
     TransactionExportParser,
     TransactionRow,
@@ -54,6 +55,86 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 class TransactionIngestionError(RuntimeError):
     """A deterministic validation or reconciliation failure for one period load."""
+
+
+@dataclass(frozen=True)
+class TemporaryDirectoryIdentity:
+    """Stable identity for the operator-selected temporary filesystem."""
+
+    device: int
+    inode: int
+
+
+def probe_private_directory(
+    path: Path,
+    *,
+    expected_identity: TemporaryDirectoryIdentity | None = None,
+) -> TemporaryDirectoryIdentity:
+    """Prove directory identity and private-file creation without trusting mode bits."""
+    if not isinstance(path, Path):
+        raise TransactionIngestionError("invalid_temporary_directory")
+    directory_fd: int | None = None
+    probe_fd: int | None = None
+    probe_name: str | None = None
+    try:
+        directory_fd = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode):
+            raise OSError("temporary path is not a directory")
+        identity = TemporaryDirectoryIdentity(before.st_dev, before.st_ino)
+        if expected_identity is not None and identity != expected_identity:
+            raise OSError("temporary directory identity changed")
+
+        probe_name = f".govtracts-probe-{secrets.token_hex(16)}"
+        probe_fd = os.open(
+            probe_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            stat.S_IRUSR | stat.S_IWUSR,
+            dir_fd=directory_fd,
+        )
+        probe_stat = os.fstat(probe_fd)
+        if not stat.S_ISREG(probe_stat.st_mode) or stat.S_IMODE(probe_stat.st_mode) != 0o600:
+            raise OSError("temporary probe is not private")
+        os.write(probe_fd, b"probe")
+        os.fsync(probe_fd)
+        os.close(probe_fd)
+        probe_fd = None
+        os.unlink(probe_name, dir_fd=directory_fd)
+        probe_name = None
+
+        after = os.stat(
+            path,
+            follow_symlinks=False,
+        )
+        if (after.st_dev, after.st_ino) != (identity.device, identity.inode):
+            raise OSError("temporary directory identity changed")
+        return identity
+    except (OSError, ValueError, TypeError):
+        raise TransactionIngestionError("invalid_temporary_directory") from None
+    finally:
+        if probe_fd is not None:
+            try:
+                os.close(probe_fd)
+            except OSError:
+                pass
+        if probe_name is not None and directory_fd is not None:
+            try:
+                os.unlink(probe_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True)
@@ -88,6 +169,8 @@ class TransactionIngestionLoader:
         *,
         batch_size: int = DEFAULT_BATCH_SIZE,
         clock: Callable[[], datetime] = _utc_now,
+        archive_copy_directory: Path | None = None,
+        archive_copy_directory_identity: TemporaryDirectoryIdentity | None = None,
     ) -> None:
         if (
             isinstance(batch_size, bool)
@@ -100,6 +183,8 @@ class TransactionIngestionLoader:
         self._engine = engine
         self._batch_size = batch_size
         self._clock = clock
+        self._archive_copy_directory = archive_copy_directory
+        self._archive_copy_directory_identity = archive_copy_directory_identity
         self._target = UsaSpendingTransaction.__table__
         self._checkpoints = UsaSpendingIngestionCheckpoint.__table__
         self._stage = _stage_table(self._target)
@@ -161,7 +246,11 @@ class TransactionIngestionLoader:
             raise TransactionIngestionError("invalid_expected_archive_sha256")
 
         lock_key = _advisory_lock_key(SOURCE, period_start, period_end)
-        with _private_archive_copy(Path(archive_path)) as (
+        with _private_archive_copy(
+            Path(archive_path),
+            directory=self._archive_copy_directory,
+            expected_directory_identity=self._archive_copy_directory_identity,
+        ) as (
             immutable_archive_path,
             archive_sha256,
         ):
@@ -344,18 +433,10 @@ class TransactionIngestionLoader:
         period_start: date,
         period_end: date,
     ) -> None:
-        if type(period_start) is not date or type(period_end) is not date:
-            raise TransactionIngestionError("invalid_fiscal_period")
         try:
-            expected_start, expected_end = fiscal_month_bounds(
-                fiscal_year,
-                calendar_year=period_start.year,
-                calendar_month=period_start.month,
-            )
+            validate_subperiod(fiscal_year, period_start, period_end)
         except (TypeError, ValueError):
             raise TransactionIngestionError("invalid_fiscal_period") from None
-        if (period_start, period_end) != (expected_start, expected_end):
-            raise TransactionIngestionError("invalid_fiscal_period")
 
     def _validate_checkpoint_metadata(self, bulk_job: BulkJobMetadata) -> None:
         if not isinstance(bulk_job, BulkJobMetadata):
@@ -664,16 +745,31 @@ def _advisory_lock_key(source: str, period_start: date, period_end: date) -> int
 
 
 @contextmanager
-def _private_archive_copy(path: Path) -> Iterator[tuple[Path, str]]:
+def _private_archive_copy(
+    path: Path,
+    *,
+    directory: Path | None = None,
+    expected_directory_identity: TemporaryDirectoryIdentity | None = None,
+) -> Iterator[tuple[Path, str]]:
     digest = hashlib.sha256()
     file_descriptor: int | None = None
     temporary_path: Path | None = None
     try:
+        if directory is not None:
+            identity = probe_private_directory(
+                directory,
+                expected_identity=expected_directory_identity,
+            )
+        else:
+            identity = None
         file_descriptor, temporary_name = tempfile.mkstemp(
             prefix="govtracts-usaspending-",
             suffix=".zip",
+            dir=directory,
         )
         temporary_path = Path(temporary_name)
+        if directory is not None:
+            probe_private_directory(directory, expected_identity=identity)
         os.fchmod(file_descriptor, stat.S_IRUSR | stat.S_IWUSR)
         with path.open("rb") as source, os.fdopen(
             file_descriptor,
@@ -685,22 +781,37 @@ def _private_archive_copy(path: Path) -> Iterator[tuple[Path, str]]:
                 digest.update(chunk)
                 destination.write(chunk)
         temporary_path.chmod(stat.S_IRUSR)
-    except OSError:
+    except BaseException as error:
         if file_descriptor is not None:
-            os.close(file_descriptor)
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
         if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        raise TransactionIngestionError("archive_snapshot_failed") from None
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if isinstance(error, (OSError, TransactionIngestionError)):
+            raise TransactionIngestionError("archive_snapshot_failed") from None
+        raise
 
+    interrupted: BaseException | None = None
     try:
         yield temporary_path, digest.hexdigest()
+    except BaseException as error:
+        interrupted = error
+        raise
     finally:
         try:
             temporary_path.unlink()
         except FileNotFoundError:
             pass
         except OSError:
-            raise TransactionIngestionError("archive_snapshot_cleanup_failed") from None
+            if interrupted is None:
+                raise TransactionIngestionError(
+                    "archive_snapshot_cleanup_failed"
+                ) from None
 
 
 def _exact_decimal(value: object) -> Decimal:

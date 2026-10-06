@@ -207,7 +207,7 @@ class UsaSpendingTransactionIngestionAttempt(Base):
         CheckConstraint(
             "status IN ('created', 'counted', 'submitting', 'submitted', "
             "'export_finished', 'archive_hashed', 'loading', 'completed', "
-            "'failed', 'submission_unknown')",
+            "'failed', 'submission_unknown', 'subdivided')",
             name="status_allowed",
         ),
         CheckConstraint("period_end >= period_start", name="period_order"),
@@ -223,7 +223,7 @@ class UsaSpendingTransactionIngestionAttempt(Base):
         CheckConstraint(
             "status NOT IN ('counted', 'submitting', 'submitted', "
             "'export_finished', 'archive_hashed', 'loading', 'completed', "
-            "'submission_unknown') OR expected_rows IS NOT NULL",
+            "'submission_unknown', 'subdivided') OR expected_rows IS NOT NULL",
             name="count_metadata",
         ),
         CheckConstraint(
@@ -255,13 +255,29 @@ class UsaSpendingTransactionIngestionAttempt(Base):
             name="archive_metadata",
         ),
         CheckConstraint(
-            "((status IN ('completed', 'failed')) = (completed_at IS NOT NULL)) AND "
+            "((status IN ('completed', 'failed', 'subdivided')) = "
+            "(completed_at IS NOT NULL)) AND "
             "(status != 'completed' OR "
             "(checkpoint_id IS NOT NULL AND expected_rows IS NOT NULL "
             "AND export_rows IS NOT NULL AND loaded_rows IS NOT NULL "
             "AND export_rows = loaded_rows "
             "AND signed_obligation_total IS NOT NULL))",
             name="terminal_fields",
+        ),
+        CheckConstraint(
+            "parent_attempt_id IS NULL OR parent_attempt_id != id",
+            name="not_self_parent",
+        ),
+        CheckConstraint(
+            "status != 'subdivided' OR ("
+            "expected_rows > 500000 AND export_rows IS NULL "
+            "AND export_columns IS NULL AND status_url IS NULL "
+            "AND file_url IS NULL AND remote_file_name IS NULL "
+            "AND archive_sha256 IS NULL AND archive_bytes IS NULL "
+            "AND loaded_rows IS NULL AND signed_obligation_total IS NULL "
+            "AND checkpoint_id IS NULL AND last_error_code IS NULL "
+            "AND last_error_detail IS NULL)",
+            name="subdivision",
         ),
         CheckConstraint(
             "status NOT IN ('failed', 'submission_unknown') "
@@ -283,6 +299,20 @@ class UsaSpendingTransactionIngestionAttempt(Base):
             "period_start",
             "period_end",
             "status",
+        ),
+        Index("ix_usaspending_attempts_parent", "parent_attempt_id"),
+        Index(
+            "uq_usaspending_attempts_parent_period",
+            "parent_attempt_id",
+            "period_start",
+            "period_end",
+            unique=True,
+            postgresql_where=text(
+                "parent_attempt_id IS NOT NULL AND status != 'failed'"
+            ),
+            sqlite_where=text(
+                "parent_attempt_id IS NOT NULL AND status != 'failed'"
+            ),
         ),
     )
 
@@ -307,6 +337,15 @@ class UsaSpendingTransactionIngestionAttempt(Base):
         ForeignKey(
             "usaspending_ingestion_checkpoints.id",
             name="fk_usaspending_attempt_checkpoint",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    parent_attempt_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey(
+            "usaspending_transaction_ingestion_attempts.id",
+            name="fk_usaspending_attempt_parent",
             ondelete="RESTRICT",
         ),
         nullable=True,

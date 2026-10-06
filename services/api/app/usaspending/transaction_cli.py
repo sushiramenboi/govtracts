@@ -17,6 +17,7 @@ from app.core.config import load_settings
 from app.db.session import Database
 from app.usaspending.client import UsaSpendingClient
 from app.usaspending.fiscal_years import fiscal_month_bounds
+from app.usaspending.transaction_backfill import global_ingestion_lease
 from app.usaspending.transaction_ingestion import TransactionIngestionLoader
 from app.usaspending.transaction_workflow import (
     TransactionIngestionWorkflow,
@@ -44,6 +45,7 @@ ALLOWED_STATUSES = frozenset(
         "completed",
         "failed",
         "submission_unknown",
+        "subdivided",
     }
 )
 RESUMABLE_STATUSES = ALLOWED_STATUSES - {
@@ -147,9 +149,10 @@ def _live_runtime() -> _Workflow:
     try:
         settings = load_settings()
         database = Database(settings)
-        client = UsaSpendingClient(settings)
-        loader = TransactionIngestionLoader(database.engine)
-        yield TransactionIngestionWorkflow(database.engine, client, loader)
+        with global_ingestion_lease(database.engine):
+            client = UsaSpendingClient(settings)
+            loader = TransactionIngestionLoader(database.engine)
+            yield TransactionIngestionWorkflow(database.engine, client, loader)
     finally:
         if database is not None:
             database.dispose()

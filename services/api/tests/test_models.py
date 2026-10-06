@@ -12,6 +12,7 @@ def test_foundation_metadata_contains_only_planned_tables() -> None:
         "opportunities",
         "upstream_cache",
         "ingestion_runs",
+        "usaspending_transaction_ingestion_attempts",
         "usaspending_ingestion_checkpoints",
         "usaspending_transactions",
         "usaspending_transaction_preset_matches",

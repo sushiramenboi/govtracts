@@ -446,6 +446,178 @@ def run_period(subject: TransactionIngestionWorkflow) -> Any:
     )
 
 
+def run_child_period(
+    subject: TransactionIngestionWorkflow,
+    *,
+    period_start: date,
+    period_end: date,
+    stop_after_count: bool = False,
+    capacity_guard: Any | None = None,
+    retry_parent_attempt_id: UUID | None = None,
+    submission_observer: Any | None = None,
+) -> Any:
+    return run(
+        subject.run_period(
+            fiscal_year=FISCAL_YEAR,
+            period_start=period_start,
+            period_end=period_end,
+            stop_after_count=stop_after_count,
+            capacity_guard=capacity_guard,
+            retry_parent_attempt_id=retry_parent_attempt_id,
+            submission_observer=submission_observer,
+        )
+    )
+
+
+@pytest.mark.integration
+def test_stop_after_count_persists_count_without_submission(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    client = StubClient(archive=archive_bytes(), pre_submission_rows=25)
+    subject = workflow(
+        disposable_postgres_engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+        loader=ExplodingLoader(),
+    )
+
+    result = run_child_period(
+        subject,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        stop_after_count=True,
+    )
+
+    assert result.status == "counted"
+    assert result.pre_submission_rows == 25
+    assert (client.count_calls, client.submit_calls, client.poll_calls) == (1, 0, 0)
+
+
+@pytest.mark.integration
+def test_submission_observer_fires_after_durable_submitted_transition(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    observed_statuses: list[str] = []
+
+    def observe_submission() -> None:
+        with disposable_postgres_engine.connect() as connection:
+            status = connection.scalar(
+                select(UsaSpendingTransactionIngestionAttempt.status)
+            )
+        assert isinstance(status, str)
+        observed_statuses.append(status)
+
+    client = StubClient(archive=archive_bytes())
+    subject = workflow(
+        disposable_postgres_engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+    )
+
+    result = run_child_period(
+        subject,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        submission_observer=observe_submission,
+    )
+
+    assert result.status == "completed"
+    assert observed_statuses == ["submitted"]
+    assert client.submit_calls == 1
+
+
+@pytest.mark.integration
+def test_oversized_counted_period_can_never_submit(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    client = StubClient(archive=archive_bytes(), pre_submission_rows=500001)
+    subject = workflow(
+        disposable_postgres_engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+        loader=ExplodingLoader(),
+    )
+
+    first = run_period(subject)
+    second = run_period(subject)
+
+    assert first.status == second.status == "counted"
+    assert first.attempt_id == second.attempt_id
+    assert first.pre_submission_rows == 500001
+    assert (client.count_calls, client.submit_calls, client.poll_calls) == (1, 0, 0)
+
+
+@pytest.mark.integration
+def test_valid_child_period_counts_exact_bounds_and_invalid_cross_month_stops(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    class ChildClient(StubClient):
+        def get_expected_transaction_count(self, start: date, end: date) -> int:
+            assert (start, end) == (date(2024, 10, 1), date(2024, 10, 16))
+            self.count_calls += 1
+            return 1
+
+    client = ChildClient(archive=archive_bytes())
+    subject = workflow(
+        disposable_postgres_engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+        loader=ExplodingLoader(),
+    )
+
+    result = run_child_period(
+        subject,
+        period_start=date(2024, 10, 1),
+        period_end=date(2024, 10, 16),
+        stop_after_count=True,
+    )
+    assert result.status == "counted"
+    assert client.count_calls == 1
+
+    with pytest.raises(TransactionWorkflowError, match="invalid_fiscal_period"):
+        run_child_period(
+            subject,
+            period_start=date(2024, 10, 31),
+            period_end=date(2024, 11, 1),
+            stop_after_count=True,
+        )
+
+
+@pytest.mark.integration
+def test_subdivided_attempt_is_no_activity_state(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    attempt_id = uuid4()
+    with disposable_postgres_engine.begin() as connection:
+        connection.execute(
+            UsaSpendingTransactionIngestionAttempt.__table__.insert(),
+            {
+                **attempt_values("created", attempt_id=attempt_id),
+                "status": "subdivided",
+                "expected_rows": 500001,
+                "completed_at": NOW,
+            },
+        )
+    client = StubClient(archive=archive_bytes())
+    result = run_period(
+        workflow(
+            disposable_postgres_engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+            loader=ExplodingLoader(),
+        )
+    )
+
+    assert result.status == "subdivided"
+    assert result.attempt_id == attempt_id
+    assert client.total_calls == 0
+
+
 @pytest.mark.integration
 def test_complete_workflow_uses_all_valid_transitions_and_safe_temporary_path(
     disposable_postgres_engine: Any,
@@ -531,6 +703,45 @@ def test_export_bound_count_drives_loader_checkpoint_and_completion(
     assert attempt["export_rows"] == attempt["loaded_rows"] == 490381
     assert attempt["export_columns"] == 16
     assert checkpoint["expected_rows"] == checkpoint["loaded_rows"] == 490381
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("advisory_rows", "export_rows"),
+    [(1, 500_000), (500_000, 1)],
+)
+def test_export_bound_count_is_guarded_for_drift_in_both_directions(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+    advisory_rows: int,
+    export_rows: int,
+) -> None:
+    archive = archive_bytes()
+    client = StubClient(
+        archive=archive,
+        pre_submission_rows=advisory_rows,
+        export_rows=export_rows,
+    )
+    loader = RecordingLoader(loaded_rows=export_rows)
+    guarded: list[int] = []
+    subject = workflow(
+        disposable_postgres_engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+        loader=loader,
+    )
+
+    result = run_child_period(
+        subject,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        capacity_guard=guarded.append,
+    )
+
+    assert result.status == "completed"
+    assert guarded == [export_rows]
+    assert client.download_calls == 1
+    assert loader.expected_counts == [export_rows]
 
 
 @pytest.mark.integration
@@ -757,6 +968,76 @@ def test_resumes_every_persisted_post_submission_state_without_resubmitting(
     assert client.submit_calls == 0
     assert client.poll_calls == (1 if resume_status == "submitted" else 0)
     assert client.download_calls == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("resume_status", "expected_guard_calls"),
+    [
+        ("submitted", [500_000, 1]),
+        ("export_finished", [1]),
+        ("archive_hashed", [1]),
+        ("loading", [1]),
+    ],
+)
+def test_every_post_submission_restart_guards_before_download_or_load(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+    resume_status: str,
+    expected_guard_calls: list[int],
+) -> None:
+    archive = archive_bytes()
+    seed_attempt(disposable_postgres_engine, resume_status, archive=archive)
+    client = StubClient(archive=archive)
+    guarded: list[int] = []
+
+    result = run_child_period(
+        workflow(
+            disposable_postgres_engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+        ),
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        stop_after_count=True,
+        capacity_guard=guarded.append,
+    )
+
+    assert result.status == "completed"
+    assert guarded == expected_guard_calls
+    assert client.download_calls == 1
+
+
+@pytest.mark.integration
+def test_submitted_restart_cannot_complete_when_capacity_guard_rejects(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    archive = archive_bytes()
+    seed_attempt(disposable_postgres_engine, "submitted", archive=archive)
+    client = StubClient(archive=archive)
+    calls: list[int] = []
+
+    def reject(rows: int) -> None:
+        calls.append(rows)
+        raise RuntimeError("capacity rejected")
+
+    with pytest.raises(RuntimeError, match="capacity rejected"):
+        run_child_period(
+            workflow(
+                disposable_postgres_engine,
+                client,
+                TrackingTemporaryDirectories(tmp_path),
+                loader=ExplodingLoader(),
+            ),
+            period_start=PERIOD_START,
+            period_end=PERIOD_END,
+            stop_after_count=True,
+            capacity_guard=reject,
+        )
+
+    assert calls == [500_000]
+    assert (client.poll_calls, client.download_calls) == (0, 0)
 
 
 @pytest.mark.integration

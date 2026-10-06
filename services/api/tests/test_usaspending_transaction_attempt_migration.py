@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -33,6 +33,60 @@ NEW_MIGRATION_PATH = (
     / "versions"
     / "20261003_0005_usaspending_export_bound_counts.py"
 )
+SUBDIVISION_MIGRATION_PATH = (
+    API_ROOT
+    / "alembic"
+    / "versions"
+    / "20261004_0006_usaspending_backfill_subdivisions.py"
+)
+MIGRATION_0005_TERMINAL_CHECK = (
+    "((status IN ('completed', 'failed')) = (completed_at IS NOT NULL)) AND "
+    "(status != 'completed' OR "
+    "(checkpoint_id IS NOT NULL AND expected_rows IS NOT NULL "
+    "AND export_rows IS NOT NULL AND loaded_rows IS NOT NULL "
+    "AND export_rows = loaded_rows "
+    "AND signed_obligation_total IS NOT NULL))"
+)
+EXPECTED_0006_INDEX_PREDICATES = {
+    "uq_usaspending_attempts_active_period": (
+        "status NOT IN ('completed', 'failed')"
+    ),
+    "uq_usaspending_attempts_parent_period": (
+        "(parent_attempt_id IS NOT NULL) AND (status != 'failed')"
+    ),
+}
+EXPECTED_0006_CHECK_EXPRESSIONS = {
+    "ck_usaspending_transaction_ingestion_attempts_status_allowed": (
+        "status IN ('created', 'counted', 'submitting', 'submitted', "
+        "'export_finished', 'archive_hashed', 'loading', 'completed', "
+        "'failed', 'submission_unknown', 'subdivided')"
+    ),
+    "ck_usaspending_transaction_ingestion_attempts_count_metadata": (
+        "(status NOT IN ('counted', 'submitting', 'submitted', "
+        "'export_finished', 'archive_hashed', 'loading', 'completed', "
+        "'submission_unknown', 'subdivided')) OR expected_rows IS NOT NULL"
+    ),
+    "ck_usaspending_transaction_ingestion_attempts_terminal_fields": (
+        "(status IN ('completed', 'failed', 'subdivided')) = "
+        "(completed_at IS NOT NULL) AND "
+        "(status != 'completed' OR checkpoint_id IS NOT NULL "
+        "AND expected_rows IS NOT NULL AND export_rows IS NOT NULL "
+        "AND loaded_rows IS NOT NULL AND export_rows = loaded_rows "
+        "AND signed_obligation_total IS NOT NULL)"
+    ),
+    "ck_usaspending_transaction_ingestion_attempts_not_self_parent": (
+        "parent_attempt_id IS NULL OR parent_attempt_id != id"
+    ),
+    "ck_usaspending_transaction_ingestion_attempts_subdivision": (
+        "status != 'subdivided' OR expected_rows > 500000 "
+        "AND export_rows IS NULL AND export_columns IS NULL "
+        "AND status_url IS NULL AND file_url IS NULL "
+        "AND remote_file_name IS NULL AND archive_sha256 IS NULL "
+        "AND archive_bytes IS NULL AND loaded_rows IS NULL "
+        "AND signed_obligation_total IS NULL AND checkpoint_id IS NULL "
+        "AND last_error_code IS NULL AND last_error_detail IS NULL"
+    ),
+}
 
 
 def _load_migration(path: Path, module_name: str) -> ModuleType:
@@ -130,12 +184,15 @@ def _assert_incremental_schema_parity(operations: Mock) -> None:
     }
     model_checks = _check_definitions(list(model_table.constraints))
     assert created_checks == {
-        name: model_checks[name]
-        for name in (
-            "ck_usaspending_transaction_ingestion_attempts_counts_nonneg",
-            "ck_usaspending_transaction_ingestion_attempts_export_metadata",
-            "ck_usaspending_transaction_ingestion_attempts_terminal_fields",
-        )
+        "ck_usaspending_transaction_ingestion_attempts_counts_nonneg": model_checks[
+            "ck_usaspending_transaction_ingestion_attempts_counts_nonneg"
+        ],
+        "ck_usaspending_transaction_ingestion_attempts_export_metadata": model_checks[
+            "ck_usaspending_transaction_ingestion_attempts_export_metadata"
+        ],
+        "ck_usaspending_transaction_ingestion_attempts_terminal_fields": (
+            _normalize_sql(MIGRATION_0005_TERMINAL_CHECK)
+        ),
     }
 
 
@@ -161,6 +218,77 @@ def test_schema_parity_rejects_same_named_semantic_mismatch(
 
     with pytest.raises(AssertionError):
         _assert_incremental_schema_parity(operations)
+
+
+def test_subdivision_migration_matches_model_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration(SUBDIVISION_MIGRATION_PATH, "subdivisions_0006")
+    operations = Mock()
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.upgrade()
+    table = UsaSpendingTransactionIngestionAttempt.__table__
+    assert migration.revision == "20261004_0006"
+    assert migration.down_revision == "20261003_0005"
+    assert operations.add_column.call_args.args[1].name == "parent_attempt_id"
+    assert operations.create_foreign_key.call_args.args[:3] == (
+        "fk_usaspending_attempt_parent",
+        table.name,
+        table.name,
+    )
+    created_indexes = {call.args[0]: call for call in operations.create_index.call_args_list}
+    assert created_indexes["uq_usaspending_attempts_parent_period"].args == (
+        "uq_usaspending_attempts_parent_period",
+        table.name,
+        ["parent_attempt_id", "period_start", "period_end"],
+    )
+    assert created_indexes["uq_usaspending_attempts_parent_period"].kwargs[
+        "unique"
+    ] is True
+    assert _normalize_sql(
+        created_indexes["uq_usaspending_attempts_parent_period"].kwargs[
+            "postgresql_where"
+        ]
+    ) == "parent_attempt_id IS NOT NULL AND status != 'failed'"
+    assert created_indexes["ix_usaspending_attempts_parent"].args == (
+        "ix_usaspending_attempts_parent",
+        table.name,
+        ["parent_attempt_id"],
+    )
+    model_checks = _check_definitions(list(table.constraints))
+    created_checks = {
+        call.args[0]: _normalize_sql(call.args[2])
+        for call in operations.create_check_constraint.call_args_list
+    }
+    for name in (
+        "ck_usaspending_transaction_ingestion_attempts_status_allowed",
+        "ck_usaspending_transaction_ingestion_attempts_count_metadata",
+        "ck_usaspending_transaction_ingestion_attempts_terminal_fields",
+        "ck_usaspending_transaction_ingestion_attempts_not_self_parent",
+        "ck_usaspending_transaction_ingestion_attempts_subdivision",
+    ):
+        assert created_checks[name] == model_checks[name]
+
+
+def test_subdivision_migration_downgrade_guard_precedes_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration(
+        SUBDIVISION_MIGRATION_PATH,
+        "subdivisions_0006_downgrade",
+    )
+    operations = Mock()
+    events: list[str] = []
+    operations.execute.side_effect = lambda *_: events.append("guard")
+    operations.drop_constraint.side_effect = lambda *_args, **_kwargs: events.append(
+        "mutation"
+    )
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.downgrade()
+
+    assert events[0] == "guard"
 
 
 def test_migration_compiles_for_postgresql_with_bounded_identifiers(
@@ -251,6 +379,741 @@ def _prepare_live_migration(
             )
             new_migration.upgrade()
     return engine, schema, old_migration, new_migration
+
+
+def _prepare_live_migration_0006(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[sa.Engine, str, ModuleType]:
+    engine, schema, _, _ = _prepare_live_migration(monkeypatch)
+    migration = _load_migration(
+        SUBDIVISION_MIGRATION_PATH,
+        f"attempts_0006_{schema}",
+    )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+        monkeypatch.setattr(
+            migration,
+            "op",
+            Operations(MigrationContext.configure(connection)),
+        )
+        migration.upgrade()
+    return engine, schema, migration
+
+
+def _normalize_driver_value(value: object) -> object:
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo is not None else value
+    if isinstance(value, Decimal):
+        return value.normalize()
+    if isinstance(value, memoryview):
+        return bytes(value)
+    if isinstance(value, dict):
+        return {
+            key: _normalize_driver_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalize_driver_value(item) for item in value)
+    return value
+
+
+def _read_normalized_attempt_rows(
+    connection: sa.Connection,
+    table: sa.Table,
+) -> dict[object, dict[str, object]]:
+    rows = (
+        {
+            key: _normalize_driver_value(value)
+            for key, value in row.items()
+        }
+        for row in connection.execute(sa.select(table).order_by(table.c.id)).mappings()
+    )
+    return {row["id"]: row for row in rows}
+
+
+def _assert_legacy_attempt_rows_preserved(
+    original_rows: dict[object, dict[str, object]],
+    upgraded_rows: dict[object, dict[str, object]],
+) -> None:
+    assert set(upgraded_rows) == set(original_rows)
+    for attempt_id, original in original_rows.items():
+        upgraded = upgraded_rows[attempt_id]
+        assert upgraded["parent_attempt_id"] is None
+        assert {
+            key: value
+            for key, value in upgraded.items()
+            if key != "parent_attempt_id"
+        } == original
+
+
+_POSTGRESQL_EXPRESSION_TOKEN = re.compile(
+    r"'(?:''|[^'])*'|<>|!=|>=|<=|::|=|>|<|[A-Za-z_][A-Za-z0-9_]*|\d+|[(),\[\]]"
+)
+
+
+def _tokenize_postgresql_expression(value: object) -> list[str]:
+    expression = str(value)
+    tokens = []
+    position = 0
+    for match in _POSTGRESQL_EXPRESSION_TOKEN.finditer(expression):
+        assert not expression[position : match.start()].strip()
+        token = match.group(0)
+        if token[0].isalpha() or token[0] == "_":
+            token = token.lower()
+        elif token == "!=":
+            token = "<>"
+        tokens.append(token)
+        position = match.end()
+    assert not expression[position:].strip()
+    return tokens
+
+
+def _remove_postgresql_type_casts(tokens: list[str]) -> list[str]:
+    without_casts = []
+    position = 0
+    while position < len(tokens):
+        if tokens[position] != "::":
+            without_casts.append(tokens[position])
+            position += 1
+            continue
+
+        position += 1
+        if tokens[position : position + 2] == ["character", "varying"]:
+            position += 2
+        else:
+            assert tokens[position : position + 1] == ["text"]
+            position += 1
+        if tokens[position : position + 2] == ["[", "]"]:
+            position += 2
+    return without_casts
+
+
+def _remove_parenthesized_identifiers(tokens: list[str]) -> list[str]:
+    identifier = re.compile(r"[a-z_][a-z0-9_]*\Z")
+    normalized = tokens
+    while True:
+        for position in range(len(normalized) - 2):
+            if (
+                normalized[position] == "("
+                and identifier.fullmatch(normalized[position + 1])
+                and normalized[position + 2] == ")"
+            ):
+                normalized = [
+                    *normalized[:position],
+                    normalized[position + 1],
+                    *normalized[position + 3 :],
+                ]
+                break
+        else:
+            return normalized
+
+
+def _quantified_array_end(
+    tokens: list[str],
+    quantifier_position: int,
+) -> tuple[int, list[str]] | None:
+    position = quantifier_position + 1
+    if tokens[position : position + 1] != ["("]:
+        return None
+    position += 1
+
+    wrapper_count = 0
+    while tokens[position : position + 1] == ["("]:
+        wrapper_count += 1
+        position += 1
+    if tokens[position : position + 2] != ["array", "["]:
+        return None
+    position += 2
+
+    item_start = position
+    bracket_depth = 1
+    while position < len(tokens) and bracket_depth:
+        if tokens[position] == "[":
+            bracket_depth += 1
+        elif tokens[position] == "]":
+            bracket_depth -= 1
+        position += 1
+    assert bracket_depth == 0
+    items = tokens[item_start : position - 1]
+
+    assert tokens[position : position + wrapper_count] == [")"] * wrapper_count
+    position += wrapper_count
+    assert tokens[position : position + 1] == [")"]
+    return position + 1, items
+
+
+def _normalize_postgresql_quantified_arrays(tokens: list[str]) -> list[str]:
+    normalized = []
+    position = 0
+    while position < len(tokens):
+        if (
+            position + 2 < len(tokens)
+            and re.fullmatch(r"[a-z_][a-z0-9_]*", tokens[position])
+            and tokens[position + 1] in {"=", "<>"}
+            and tokens[position + 2] in {"any", "all"}
+        ):
+            parsed = _quantified_array_end(tokens, position + 2)
+            if parsed is not None:
+                end, items = parsed
+                operator = (tokens[position + 1], tokens[position + 2])
+                if operator == ("=", "any"):
+                    normalized.extend(
+                        [tokens[position], "in", "(", *items, ")"]
+                    )
+                    position = end
+                    continue
+                if operator == ("<>", "all"):
+                    normalized.extend(
+                        [tokens[position], "not", "in", "(", *items, ")"]
+                    )
+                    position = end
+                    continue
+        normalized.append(tokens[position])
+        position += 1
+    return normalized
+
+
+def _matching_parenthesis(tokens: list[str], start: int) -> int | None:
+    depth = 0
+    for position in range(start, len(tokens)):
+        if tokens[position] == "(":
+            depth += 1
+        elif tokens[position] == ")":
+            depth -= 1
+            assert depth >= 0
+            if depth == 0:
+                return position
+    assert depth == 0
+    return None
+
+
+def _strip_redundant_outer_parentheses(tokens: list[str]) -> list[str]:
+    normalized = tokens
+    while (
+        len(normalized) >= 2
+        and normalized[0] == "("
+        and _matching_parenthesis(normalized, 0) == len(normalized) - 1
+    ):
+        normalized = normalized[1:-1]
+    return normalized
+
+
+def _canonical_postgresql_expression(value: object) -> str:
+    tokens = _tokenize_postgresql_expression(value)
+    tokens = _remove_postgresql_type_casts(tokens)
+    tokens = _remove_parenthesized_identifiers(tokens)
+    tokens = _normalize_postgresql_quantified_arrays(tokens)
+    tokens = _strip_redundant_outer_parentheses(tokens)
+    expression = " ".join(tokens)
+    expression = re.sub(r"\s+([,\)\]])", r"\1", expression)
+    return re.sub(r"([\(\[])\s+", r"\1", expression)
+
+
+def _assert_canonical_expression(actual: object, expected: str) -> None:
+    assert _canonical_postgresql_expression(actual) == (
+        _canonical_postgresql_expression(expected)
+    )
+
+
+def _postgresql_index_predicate(index: dict[str, object]) -> object | None:
+    dialect_options = index.get("dialect_options", {})
+    assert isinstance(dialect_options, dict)
+    return dialect_options.get("postgresql_where")
+
+
+def _assert_0006_index_predicates(
+    indexes: dict[str, dict[str, object]],
+) -> None:
+    for name, expected in EXPECTED_0006_INDEX_PREDICATES.items():
+        actual = _postgresql_index_predicate(indexes[name])
+        assert actual is not None
+        _assert_canonical_expression(actual, expected)
+
+    for name in (
+        "ix_usaspending_attempts_period_status",
+        "ix_usaspending_attempts_parent",
+    ):
+        assert _postgresql_index_predicate(indexes[name]) is None
+
+
+def _assert_0006_check_expressions(checks: dict[str, object]) -> None:
+    assert set(EXPECTED_0006_CHECK_EXPRESSIONS) <= set(checks)
+    for name, expected in EXPECTED_0006_CHECK_EXPRESSIONS.items():
+        _assert_canonical_expression(checks[name], expected)
+
+
+@pytest.mark.parametrize(
+    ("index_name", "predicate"),
+    [
+        (
+            "uq_usaspending_attempts_active_period",
+            "status NOT IN ('completed', 'failed', 'created')",
+        ),
+        (
+            "uq_usaspending_attempts_parent_period",
+            "(parent_attempt_id IS NOT NULL) OR (status != 'failed')",
+        ),
+        (
+            "ix_usaspending_attempts_period_status",
+            "status != 'failed'",
+        ),
+        (
+            "ix_usaspending_attempts_parent",
+            "parent_attempt_id IS NOT NULL",
+        ),
+    ],
+)
+def test_0006_index_predicate_assertions_reject_semantic_changes(
+    index_name: str,
+    predicate: str,
+) -> None:
+    indexes = {
+        name: {"dialect_options": {"postgresql_where": expected}}
+        for name, expected in EXPECTED_0006_INDEX_PREDICATES.items()
+    }
+    indexes.update(
+        {
+            "ix_usaspending_attempts_period_status": {
+                "dialect_options": {"postgresql_where": None}
+            },
+            "ix_usaspending_attempts_parent": {
+                "dialect_options": {"postgresql_where": None}
+            },
+        }
+    )
+    indexes[index_name]["dialect_options"]["postgresql_where"] = predicate
+
+    with pytest.raises(AssertionError):
+        _assert_0006_index_predicates(indexes)
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "expression"),
+    [
+        (
+            "ck_usaspending_transaction_ingestion_attempts_status_allowed",
+            EXPECTED_0006_CHECK_EXPRESSIONS[
+                "ck_usaspending_transaction_ingestion_attempts_status_allowed"
+            ].replace("'subdivided')", "'subdivided', 'unexpected')"),
+        ),
+        (
+            "ck_usaspending_transaction_ingestion_attempts_status_allowed",
+            EXPECTED_0006_CHECK_EXPRESSIONS[
+                "ck_usaspending_transaction_ingestion_attempts_status_allowed"
+            ].replace(", 'subdivided'", ""),
+        ),
+        (
+            "ck_usaspending_transaction_ingestion_attempts_terminal_fields",
+            EXPECTED_0006_CHECK_EXPRESSIONS[
+                "ck_usaspending_transaction_ingestion_attempts_terminal_fields"
+            ].replace(") AND (status", ") OR (status"),
+        ),
+        (
+            "ck_usaspending_transaction_ingestion_attempts_subdivision",
+            EXPECTED_0006_CHECK_EXPRESSIONS[
+                "ck_usaspending_transaction_ingestion_attempts_subdivision"
+            ].replace(
+                "OR expected_rows > 500000",
+                "AND expected_rows > 500000",
+            ),
+        ),
+    ],
+)
+def test_0006_check_assertions_reject_semantic_changes(
+    constraint_name: str,
+    expression: str,
+) -> None:
+    checks = dict(EXPECTED_0006_CHECK_EXPRESSIONS)
+    checks[constraint_name] = expression
+
+    with pytest.raises(AssertionError):
+        _assert_0006_check_expressions(checks)
+
+
+def _assert_live_0006_schema(connection: sa.Connection) -> None:
+    table_name = "usaspending_transaction_ingestion_attempts"
+    model_table = UsaSpendingTransactionIngestionAttempt.__table__
+    inspector = inspect(connection)
+
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns(table_name)
+    }
+    assert set(columns) == set(model_table.c.keys())
+    for name, model_column in model_table.c.items():
+        assert columns[name]["nullable"] is model_column.nullable
+
+    foreign_keys = {
+        foreign_key["name"]: foreign_key
+        for foreign_key in inspector.get_foreign_keys(table_name)
+    }
+    parent_foreign_key = foreign_keys["fk_usaspending_attempt_parent"]
+    assert parent_foreign_key["constrained_columns"] == ["parent_attempt_id"]
+    assert parent_foreign_key["referred_table"] == table_name
+    assert parent_foreign_key["referred_columns"] == ["id"]
+    assert parent_foreign_key["options"]["ondelete"].upper() == "RESTRICT"
+
+    indexes = {
+        index["name"]: index
+        for index in inspector.get_indexes(table_name)
+    }
+    expected_indexes = {
+        "uq_usaspending_attempts_active_period": (
+            ["source", "period_start", "period_end"],
+            True,
+        ),
+        "ix_usaspending_attempts_period_status": (
+            ["source", "period_start", "period_end", "status"],
+            False,
+        ),
+        "ix_usaspending_attempts_parent": (["parent_attempt_id"], False),
+        "uq_usaspending_attempts_parent_period": (
+            ["parent_attempt_id", "period_start", "period_end"],
+            True,
+        ),
+    }
+    assert set(indexes) == set(expected_indexes)
+    for name, (column_names, unique) in expected_indexes.items():
+        assert indexes[name]["column_names"] == column_names
+        assert indexes[name]["unique"] is unique
+    _assert_0006_index_predicates(indexes)
+
+    checks = {
+        check["name"]: check["sqltext"]
+        for check in inspector.get_check_constraints(table_name)
+    }
+    _assert_0006_check_expressions(checks)
+
+    primary_key = inspector.get_pk_constraint(table_name)
+    identifiers = [
+        table_name,
+        *columns,
+        *indexes,
+        *foreign_keys,
+        *checks,
+        primary_key["name"],
+    ]
+    assert all(identifier is not None for identifier in identifiers)
+    assert max(len(identifier) for identifier in identifiers if identifier) <= 63
+
+
+@pytest.mark.integration
+def test_live_postgresql_0006_preserves_populated_0005_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, schema, _, _ = _prepare_live_migration(monkeypatch)
+    migration = _load_migration(
+        SUBDIVISION_MIGRATION_PATH,
+        f"attempts_0006_populated_{schema}",
+    )
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    checkpoint_id = uuid4()
+    completed_id = uuid4()
+    failed_id = uuid4()
+    submitted_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+            connection.execute(
+                sa.text(
+                    "INSERT INTO usaspending_ingestion_checkpoints (id) "
+                    "VALUES (:checkpoint_id)"
+                ),
+                {"checkpoint_id": checkpoint_id},
+            )
+            attempts_0005 = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            common = {
+                "source": "usaspending",
+                "fiscal_year": 2025,
+                "expected_rows": None,
+                "status_url": None,
+                "file_url": None,
+                "remote_file_name": None,
+                "archive_sha256": None,
+                "archive_bytes": None,
+                "loaded_rows": None,
+                "signed_obligation_total": None,
+                "checkpoint_id": None,
+                "last_error_code": None,
+                "last_error_detail": None,
+                "failure_count": 0,
+                "started_at": now,
+                "completed_at": None,
+                "created_at": now,
+                "updated_at": now,
+                "export_rows": None,
+                "export_columns": None,
+            }
+            connection.execute(
+                attempts_0005.insert(),
+                [
+                    {
+                        "id": completed_id,
+                        **common,
+                        "period_start": date(2024, 10, 1),
+                        "period_end": date(2024, 10, 31),
+                        "status": "completed",
+                        "expected_rows": 7,
+                        "export_rows": 7,
+                        "export_columns": 16,
+                        "status_url": "https://example.invalid/status/completed",
+                        "file_url": "https://example.invalid/file/completed",
+                        "remote_file_name": "completed.zip",
+                        "archive_sha256": "a" * 64,
+                        "archive_bytes": 123,
+                        "loaded_rows": 7,
+                        "signed_obligation_total": Decimal("12.34"),
+                        "checkpoint_id": checkpoint_id,
+                        "completed_at": now,
+                    },
+                    {
+                        "id": failed_id,
+                        **common,
+                        "period_start": date(2024, 11, 1),
+                        "period_end": date(2024, 11, 30),
+                        "status": "failed",
+                        "expected_rows": 3,
+                        "last_error_code": "test_failure",
+                        "last_error_detail": "stable test detail",
+                        "failure_count": 1,
+                        "completed_at": now,
+                    },
+                    {
+                        "id": submitted_id,
+                        **common,
+                        "period_start": date(2024, 12, 1),
+                        "period_end": date(2024, 12, 31),
+                        "status": "submitted",
+                        "expected_rows": 4,
+                        "status_url": "https://example.invalid/status/submitted",
+                        "file_url": "https://example.invalid/file/submitted",
+                        "remote_file_name": "submitted.zip",
+                    },
+                ],
+            )
+            original_rows = _read_normalized_attempt_rows(
+                connection,
+                attempts_0005,
+            )
+
+            monkeypatch.setattr(
+                migration,
+                "op",
+                Operations(MigrationContext.configure(connection)),
+            )
+            migration.upgrade()
+
+            attempts_0006 = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            upgraded_rows = _read_normalized_attempt_rows(
+                connection,
+                attempts_0006,
+            )
+            _assert_legacy_attempt_rows_preserved(original_rows, upgraded_rows)
+            _assert_live_0006_schema(connection)
+
+            migration.downgrade()
+            attempts_downgraded = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            downgraded_rows = _read_normalized_attempt_rows(
+                connection,
+                attempts_downgraded,
+            )
+            assert downgraded_rows == original_rows
+
+            migration.upgrade()
+            attempts_reupgraded = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            reupgraded_rows = _read_normalized_attempt_rows(
+                connection,
+                attempts_reupgraded,
+            )
+            _assert_legacy_attempt_rows_preserved(original_rows, reupgraded_rows)
+            _assert_live_0006_schema(connection)
+    finally:
+        _drop_live_schema(engine, schema)
+
+
+@pytest.mark.integration
+def test_live_postgresql_0006_round_trip_and_used_downgrade_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, schema, migration = _prepare_live_migration_0006(monkeypatch)
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+            assert "parent_attempt_id" in {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "usaspending_transaction_ingestion_attempts"
+                )
+            }
+            monkeypatch.setattr(
+                migration,
+                "op",
+                Operations(MigrationContext.configure(connection)),
+            )
+            migration.downgrade()
+            assert "parent_attempt_id" not in {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "usaspending_transaction_ingestion_attempts"
+                )
+            }
+            migration.upgrade()
+
+            attempts = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            parent_id = uuid4()
+            base = {
+                "source": "usaspending",
+                "fiscal_year": 2025,
+                "failure_count": 0,
+                "started_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": parent_id,
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 31),
+                    "status": "subdivided",
+                    "expected_rows": 500001,
+                    "completed_at": now,
+                },
+            )
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": uuid4(),
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 16),
+                    "status": "created",
+                    "parent_attempt_id": parent_id,
+                },
+            )
+
+        with pytest.raises(DBAPIError, match="used USAspending subdivisions"):
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+                monkeypatch.setattr(
+                    migration,
+                    "op",
+                    Operations(MigrationContext.configure(connection)),
+                )
+                migration.downgrade()
+
+        with engine.connect() as connection:
+            connection.exec_driver_sql(f'SET search_path TO "{schema}"')
+            assert "parent_attempt_id" in {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "usaspending_transaction_ingestion_attempts"
+                )
+            }
+            assert connection.scalar(
+                sa.select(sa.func.count()).select_from(
+                    sa.Table(
+                        "usaspending_transaction_ingestion_attempts",
+                        sa.MetaData(),
+                        autoload_with=connection,
+                    )
+                )
+            ) == 2
+    finally:
+        _drop_live_schema(engine, schema)
+
+
+@pytest.mark.integration
+def test_live_postgresql_0006_enforces_self_parent_and_parent_delete_restriction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, schema, _migration = _prepare_live_migration_0006(monkeypatch)
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+            attempts = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            parent_id = uuid4()
+            base = {
+                "source": "usaspending",
+                "fiscal_year": 2025,
+                "failure_count": 0,
+                "started_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        attempts.insert(),
+                        {
+                            "id": parent_id,
+                            **base,
+                            "period_start": date(2024, 10, 1),
+                            "period_end": date(2024, 10, 31),
+                            "status": "created",
+                            "parent_attempt_id": parent_id,
+                        },
+                    )
+
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": parent_id,
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 31),
+                    "status": "subdivided",
+                    "expected_rows": 500001,
+                    "completed_at": now,
+                },
+            )
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": uuid4(),
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 16),
+                    "status": "created",
+                    "parent_attempt_id": parent_id,
+                },
+            )
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        attempts.delete().where(attempts.c.id == parent_id)
+                    )
+    finally:
+        _drop_live_schema(engine, schema)
 
 
 def _drop_live_schema(engine: sa.Engine, schema: str) -> None:

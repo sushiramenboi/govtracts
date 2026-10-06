@@ -27,13 +27,14 @@ from app.usaspending.client import (
     UsaSpendingClient,
     UsaSpendingError,
 )
-from app.usaspending.fiscal_years import fiscal_month_bounds
+from app.usaspending.fiscal_years import fiscal_month_bounds, validate_subperiod
 from app.usaspending.transaction_export import DEFAULT_MAX_ROWS, TransactionExportError
 from app.usaspending.transaction_ingestion import (
     BulkJobMetadata,
     TransactionIngestionError,
     TransactionIngestionLoader,
     TransactionIngestionResult,
+    probe_private_directory,
 )
 
 
@@ -69,6 +70,8 @@ DETERMINISTIC_UPSTREAM_ERRORS = frozenset(
 )
 AttemptRow = dict[str, Any]
 TemporaryDirectoryFactory = Callable[[], AbstractContextManager[Path | str]]
+CapacityGuard = Callable[[int], None]
+SubmissionObserver = Callable[[], None]
 
 
 class TransactionWorkflowError(RuntimeError):
@@ -148,11 +151,45 @@ class TransactionIngestionWorkflow:
         except (TypeError, ValueError):
             raise TransactionWorkflowError("invalid_fiscal_period") from None
 
+        return await self.run_period(
+            fiscal_year=fiscal_year,
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+    async def run_period(
+        self,
+        *,
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+        stop_after_count: bool = False,
+        capacity_guard: CapacityGuard | None = None,
+        retry_parent_attempt_id: UUID | None = None,
+        submission_observer: SubmissionObserver | None = None,
+    ) -> TransactionWorkflowResult:
+        """Run or resume one validated same-month, same-FY inclusive period."""
+        if not isinstance(stop_after_count, bool):
+            raise TransactionWorkflowError("invalid_stop_after_count")
+        if capacity_guard is not None and not callable(capacity_guard):
+            raise TransactionWorkflowError("invalid_capacity_guard")
+        if submission_observer is not None and not callable(submission_observer):
+            raise TransactionWorkflowError("invalid_submission_observer")
+        if retry_parent_attempt_id is not None and not isinstance(
+            retry_parent_attempt_id, UUID
+        ):
+            raise TransactionWorkflowError("invalid_retry_parent")
+        try:
+            validate_subperiod(fiscal_year, period_start, period_end)
+        except (TypeError, ValueError):
+            raise TransactionWorkflowError("invalid_fiscal_period") from None
+
         try:
             attempt = self._locate_or_create_attempt(
                 fiscal_year=fiscal_year,
                 period_start=period_start,
                 period_end=period_end,
+                parent_attempt_id=retry_parent_attempt_id,
             )
         except SQLAlchemyError:
             raise TransactionWorkflowError("database_operation_failed") from None
@@ -161,6 +198,9 @@ class TransactionIngestionWorkflow:
         local_archive: Path | None = None
         local_sha256: str | None = None
         local_bytes: int | None = None
+        guarded_export_rows: int | None = None
+        guarded_restart_without_export_rows = False
+        submitted_in_this_invocation = False
 
         with ExitStack() as resources:
             for _ in range(12):
@@ -170,6 +210,8 @@ class TransactionIngestionWorkflow:
                 if status == "failed":
                     return self._result(attempt)
                 if status == "submission_unknown":
+                    return self._result(attempt)
+                if status == "subdivided":
                     return self._result(attempt)
 
                 if status == "created":
@@ -204,6 +246,15 @@ class TransactionIngestionWorkflow:
                     continue
 
                 if status == "counted":
+                    expected_rows = attempt.get("expected_rows")
+                    if (
+                        not isinstance(expected_rows, int)
+                        or isinstance(expected_rows, bool)
+                        or expected_rows < 0
+                    ):
+                        raise TransactionWorkflowError("invalid_expected_count")
+                    if stop_after_count or expected_rows > DEFAULT_MAX_ROWS:
+                        return self._result(attempt)
                     (
                         attempt,
                         submission_claimed,
@@ -255,9 +306,20 @@ class TransactionIngestionWorkflow:
                     submission_claimed = False
                     if not persisted:
                         return self._result(attempt)
+                    submitted_in_this_invocation = True
+                    if submission_observer is not None:
+                        submission_observer()
                     continue
 
                 if status == "submitted":
+                    if (
+                        capacity_guard is not None
+                        and not guarded_restart_without_export_rows
+                        and attempt.get("export_rows") is None
+                        and not submitted_in_this_invocation
+                    ):
+                        capacity_guard(DEFAULT_MAX_ROWS)
+                        guarded_restart_without_export_rows = True
                     try:
                         job = self._job_from_attempt(attempt)
                         completed = await self._client.poll_bulk_export(job)
@@ -307,6 +369,21 @@ class TransactionIngestionWorkflow:
                     continue
 
                 if status in {"export_finished", "archive_hashed", "loading"}:
+                    export_rows = attempt.get("export_rows")
+                    if (
+                        not isinstance(export_rows, int)
+                        or isinstance(export_rows, bool)
+                        or not 0 <= export_rows <= DEFAULT_MAX_ROWS
+                    ):
+                        raise TransactionWorkflowError(
+                            "invalid_persisted_export_rows"
+                        )
+                    if (
+                        capacity_guard is not None
+                        and guarded_export_rows != export_rows
+                    ):
+                        capacity_guard(export_rows)
+                        guarded_export_rows = export_rows
                     if local_archive is None:
                         try:
                             (
@@ -454,6 +531,7 @@ class TransactionIngestionWorkflow:
         fiscal_year: int,
         period_start: date,
         period_end: date,
+        parent_attempt_id: UUID | None = None,
     ) -> AttemptRow:
         lock_key = _attempt_lock_key(SOURCE, period_start, period_end)
         try:
@@ -494,6 +572,7 @@ class TransactionIngestionWorkflow:
                         "period_end": period_end,
                         "status": "created",
                         "failure_count": 0,
+                        "parent_attempt_id": parent_attempt_id,
                         "started_at": now,
                         "created_at": now,
                         "updated_at": now,
@@ -680,11 +759,13 @@ class TransactionIngestionWorkflow:
             self._temporary_directory_factory()
         )
         directory = Path(directory_value)
-        if not directory.is_dir():
+        try:
+            probe_private_directory(directory)
+        except TransactionIngestionError:
             raise _DeterministicFailure(
                 "invalid_temporary_directory",
                 "Private temporary directory is unavailable.",
-            )
+            ) from None
         destination = directory / FIXED_ARCHIVE_FILENAME
         reported_bytes = await self._client.retrieve_bulk_export(
             completed,

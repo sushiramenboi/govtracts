@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import csv
 import hashlib
@@ -54,6 +55,165 @@ BULK_JOB = BulkJobMetadata(
     status_url="https://api.usaspending.gov/api/v2/bulk_download/status/example/",
     file_name="transactions.zip",
 )
+
+
+def test_private_archive_copy_uses_configured_directory_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.zip"
+    source.write_bytes(b"archive")
+    configured = tmp_path / "configured"
+    configured.mkdir()
+
+    with transaction_ingestion_module._private_archive_copy(
+        source,
+        directory=configured,
+    ) as (snapshot, digest):
+        assert snapshot.parent == configured
+        assert snapshot.read_bytes() == b"archive"
+        assert digest == hashlib.sha256(b"archive").hexdigest()
+        assert oct(snapshot.stat().st_mode & 0o777) == "0o400"
+
+    assert list(configured.iterdir()) == []
+
+
+def test_private_archive_copy_cleans_up_when_copy_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.zip"
+    source.write_bytes(b"archive")
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    real_open = Path.open
+
+    class InterruptingSource:
+        def __enter__(self) -> InterruptingSource:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            raise KeyboardInterrupt
+
+    def interrupt_source(path: Path, *args: object, **kwargs: object) -> Any:
+        if path == source:
+            return InterruptingSource()
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", interrupt_source)
+    with pytest.raises(KeyboardInterrupt):
+        with transaction_ingestion_module._private_archive_copy(
+            source,
+            directory=configured,
+        ):
+            pytest.fail("copy interruption must occur before yield")
+
+    assert list(configured.iterdir()) == []
+
+
+def test_private_archive_copy_cleans_up_when_interrupted_before_yield(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.zip"
+    source.write_bytes(b"archive")
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    real_chmod = Path.chmod
+
+    def interrupt_chmod(path: Path, mode: int) -> None:
+        if path.parent == configured:
+            raise GeneratorExit
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", interrupt_chmod)
+    with pytest.raises(GeneratorExit):
+        with transaction_ingestion_module._private_archive_copy(
+            source,
+            directory=configured,
+        ):
+            pytest.fail("chmod interruption must occur before yield")
+
+    assert list(configured.iterdir()) == []
+
+
+def test_private_archive_copy_preserves_cancellation_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.zip"
+    source.write_bytes(b"archive")
+    configured = tmp_path / "configured"
+    configured.mkdir()
+
+    with pytest.raises(asyncio.CancelledError):
+        with transaction_ingestion_module._private_archive_copy(
+            source,
+            directory=configured,
+        ):
+            raise asyncio.CancelledError
+
+    assert list(configured.iterdir()) == []
+
+
+def test_private_directory_probe_detects_replacement_removal_and_symlink_swap(
+    tmp_path: Path,
+) -> None:
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    identity = transaction_ingestion_module.probe_private_directory(configured)
+    assert list(configured.iterdir()) == []
+
+    original = tmp_path / "original"
+    configured.rename(original)
+    configured.mkdir()
+    with pytest.raises(TransactionIngestionError, match="invalid_temporary_directory"):
+        transaction_ingestion_module.probe_private_directory(
+            configured,
+            expected_identity=identity,
+        )
+
+    configured.rmdir()
+    with pytest.raises(TransactionIngestionError, match="invalid_temporary_directory"):
+        transaction_ingestion_module.probe_private_directory(
+            configured,
+            expected_identity=identity,
+        )
+
+    configured.symlink_to(original, target_is_directory=True)
+    with pytest.raises(TransactionIngestionError, match="invalid_temporary_directory"):
+        transaction_ingestion_module.probe_private_directory(
+            configured,
+            expected_identity=identity,
+        )
+
+
+def test_private_directory_probe_proves_creation_even_for_privileged_test_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    real_open = os.open
+
+    def deny_probe_creation(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is not None and flags & os.O_CREAT:
+            raise PermissionError("simulated unwritable directory")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(transaction_ingestion_module.os, "open", deny_probe_creation)
+    with pytest.raises(TransactionIngestionError, match="invalid_temporary_directory"):
+        transaction_ingestion_module.probe_private_directory(configured)
+    assert list(configured.iterdir()) == []
+
+
 BASE_ROW = {
     "contract_transaction_unique_key": "transaction-1",
     "contract_award_unique_key": "CONT_AWD_1",
@@ -312,6 +472,42 @@ def load_archive_with_connection(
         bulk_job=BULK_JOB,
         expected_archive_sha256=expected_archive_sha256,
     )
+
+
+@pytest.mark.parametrize(
+    ("period_start", "period_end"),
+    [
+        (date(2024, 10, 1), date(2024, 10, 1)),
+        (date(2024, 10, 2), date(2024, 10, 16)),
+        (date(2024, 10, 17), date(2024, 10, 31)),
+    ],
+)
+def test_loader_accepts_same_month_same_fiscal_year_subperiods(
+    period_start: date,
+    period_end: date,
+) -> None:
+    loader(FakeEngine())._validate_period(FISCAL_YEAR, period_start, period_end)
+
+
+@pytest.mark.parametrize(
+    ("fiscal_year", "period_start", "period_end"),
+    [
+        (FISCAL_YEAR, date(2024, 10, 2), date(2024, 10, 1)),
+        (FISCAL_YEAR, date(2024, 10, 31), date(2024, 11, 1)),
+        (2024, date(2024, 10, 1), date(2024, 10, 1)),
+    ],
+)
+def test_loader_rejects_reversed_cross_month_or_cross_fy_subperiods(
+    fiscal_year: int,
+    period_start: date,
+    period_end: date,
+) -> None:
+    with pytest.raises(TransactionIngestionError, match="invalid_fiscal_period"):
+        loader(FakeEngine())._validate_period(
+            fiscal_year,
+            period_start,
+            period_end,
+        )
 
 
 def test_load_remains_a_self_managed_transaction_wrapper(

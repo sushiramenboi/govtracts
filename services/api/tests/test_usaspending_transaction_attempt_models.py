@@ -83,6 +83,7 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "loaded_rows",
         "signed_obligation_total",
         "checkpoint_id",
+        "parent_attempt_id",
         "last_error_code",
         "last_error_detail",
         "failure_count",
@@ -101,11 +102,17 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "fk_usaspending_attempt_checkpoint": (
             "usaspending_ingestion_checkpoints.id",
             "RESTRICT",
-        )
+        ),
+        "fk_usaspending_attempt_parent": (
+            "usaspending_transaction_ingestion_attempts.id",
+            "RESTRICT",
+        ),
     }
     assert {index.name: index.unique for index in table.indexes} == {
+        "ix_usaspending_attempts_parent": False,
         "ix_usaspending_attempts_period_status": False,
         "uq_usaspending_attempts_active_period": True,
+        "uq_usaspending_attempts_parent_period": True,
     }
     active_index = next(
         index
@@ -128,10 +135,27 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "ck_usaspending_transaction_ingestion_attempts_fiscal_year_range",
         "ck_usaspending_transaction_ingestion_attempts_hash_lower_hex",
         "ck_usaspending_transaction_ingestion_attempts_job_metadata",
+        "ck_usaspending_transaction_ingestion_attempts_not_self_parent",
         "ck_usaspending_transaction_ingestion_attempts_period_order",
         "ck_usaspending_transaction_ingestion_attempts_status_allowed",
+        "ck_usaspending_transaction_ingestion_attempts_subdivision",
         "ck_usaspending_transaction_ingestion_attempts_terminal_fields",
     }
+
+    parent_period_index = next(
+        index
+        for index in table.indexes
+        if index.name == "uq_usaspending_attempts_parent_period"
+    )
+    assert parent_period_index.unique is True
+    assert tuple(column.name for column in parent_period_index.columns) == (
+        "parent_attempt_id",
+        "period_start",
+        "period_end",
+    )
+    assert str(parent_period_index.dialect_options["postgresql"]["where"]) == (
+        "parent_attempt_id IS NOT NULL AND status != 'failed'"
+    )
 
 
 def test_only_one_nonterminal_attempt_can_exist_for_a_period() -> None:
@@ -315,5 +339,118 @@ def test_historical_failed_attempt_accepts_null_export_metadata() -> None:
                 )
             ).one()
         assert row == ("failed", None, None)
+    finally:
+        engine.dispose()
+
+
+def test_subdivided_parent_is_terminal_and_blocks_replacement() -> None:
+    engine = _database()
+    table = models.UsaSpendingTransactionIngestionAttempt.__table__
+    try:
+        parent = _attempt_values(
+            status="subdivided",
+            expected_rows=500001,
+            completed_at=NOW,
+        )
+        with engine.begin() as connection:
+            connection.execute(table.insert(), parent)
+            connection.execute(
+                table.insert(),
+                _attempt_values(
+                    period_end=date(2024, 10, 16),
+                    parent_attempt_id=parent["id"],
+                ),
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(table.insert(), _attempt_values())
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert(),
+                    _attempt_values(
+                        id=parent["id"],
+                        period_start=date(2024, 11, 1),
+                        period_end=date(2024, 11, 30),
+                        parent_attempt_id=parent["id"],
+                    ),
+                )
+    finally:
+        engine.dispose()
+
+
+def test_failed_child_history_allows_one_linked_replacement() -> None:
+    engine = _database()
+    table = models.UsaSpendingTransactionIngestionAttempt.__table__
+    try:
+        parent = _attempt_values(
+            status="subdivided",
+            expected_rows=500001,
+            completed_at=NOW,
+        )
+        failed = _attempt_values(
+            period_end=date(2024, 10, 16),
+            parent_attempt_id=parent["id"],
+            status="failed",
+            last_error_code="test_failure",
+            completed_at=NOW,
+        )
+        replacement = _attempt_values(
+            period_end=date(2024, 10, 16),
+            parent_attempt_id=parent["id"],
+        )
+        with engine.begin() as connection:
+            connection.execute(table.insert(), parent)
+            connection.execute(table.insert(), failed)
+            connection.execute(table.insert(), replacement)
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert(),
+                    _attempt_values(
+                        period_end=date(2024, 10, 16),
+                        parent_attempt_id=parent["id"],
+                    ),
+                )
+
+        with engine.connect() as connection:
+            rows = connection.execute(
+                select(table.c.id, table.c.status, table.c.parent_attempt_id).where(
+                    table.c.parent_attempt_id == parent["id"]
+                )
+            ).all()
+        assert {(row.status, row.parent_attempt_id) for row in rows} == {
+            ("failed", parent["id"]),
+            ("created", parent["id"]),
+        }
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"status": "subdivided", "expected_rows": 500000, "completed_at": NOW},
+        {
+            "status": "subdivided",
+            "expected_rows": 500001,
+            "completed_at": NOW,
+            "status_url": "https://api.usaspending.gov/status/1",
+        },
+        {"status": "subdivided", "expected_rows": 500001},
+    ],
+)
+def test_subdivided_metadata_contract_rejects_invalid_state(
+    overrides: dict[str, object],
+) -> None:
+    engine = _database()
+    table = models.UsaSpendingTransactionIngestionAttempt.__table__
+    try:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(table.insert(), _attempt_values(**overrides))
     finally:
         engine.dispose()
