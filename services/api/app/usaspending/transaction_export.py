@@ -343,7 +343,7 @@ class TransactionExportParser:
             raise TransactionExportError(f"action_date_outside_period_at_row_{row_number}")
         obligation = self._parse_decimal(row["federal_action_obligation"], row_number)
 
-        recipient_name = self._required(row, "recipient_name", row_number)
+        recipient_name = row["recipient_name"].strip()
         recipient_uei = self._parse_uei(
             self._required(row, "recipient_uei", row_number),
             "recipient_uei",

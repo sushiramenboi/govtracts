@@ -731,6 +731,22 @@ def test_first_load_maps_every_field_and_preserves_exact_signed_amounts(tmp_path
     assert "ingestion_runs" not in all_sql
 
 
+def test_loader_preserves_normalized_empty_recipient_name(tmp_path: Path) -> None:
+    archive = write_archive(
+        tmp_path,
+        [transaction_row(recipient_name=" \t ")],
+        name="empty-recipient-name.zip",
+    )
+    engine = FakeEngine()
+
+    result = load_archive(loader(engine), archive, expected_count=1)
+
+    assert result.loaded_rows == 1
+    assert engine.state.transactions["transaction-1"]["recipient_name"] == ""
+    assert engine.commits == 1
+    assert engine.rollbacks == 0
+
+
 @pytest.mark.parametrize("reported_rowcount", [-1, 0])
 def test_non_authoritative_upsert_rowcount_allows_valid_first_load(
     tmp_path: Path,

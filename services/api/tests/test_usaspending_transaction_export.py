@@ -180,6 +180,29 @@ def test_optional_parent_and_classification_values_may_be_empty(tmp_path: Path) 
     assert rows[0].psc_code is None
 
 
+@pytest.mark.parametrize(
+    ("recipient_name", "expected_name"),
+    [
+        ("", ""),
+        (" \t ", ""),
+        ("  Example Recipient  ", "Example Recipient"),
+    ],
+)
+def test_recipient_names_are_normalized(
+    tmp_path: Path,
+    recipient_name: str,
+    expected_name: str,
+) -> None:
+    archive_path = write_archive(
+        tmp_path,
+        rows=[transaction_row(recipient_name=recipient_name)],
+    )
+
+    rows, _ = consume(archive_path)
+
+    assert rows[0].recipient_name == expected_name
+
+
 def test_duplicate_transaction_ids_are_rejected(tmp_path: Path) -> None:
     archive_path = write_archive(tmp_path, rows=[transaction_row(), transaction_row()])
 
@@ -196,7 +219,6 @@ def test_duplicate_transaction_ids_are_rejected(tmp_path: Path) -> None:
         "recipient_uei",
         "awarding_agency_name",
         "awarding_sub_agency_name",
-        "recipient_name",
         "transaction_description",
         "last_modified_date",
     ],
@@ -283,6 +305,15 @@ def test_expected_count_mismatch_is_rejected_after_streaming(tmp_path: Path) -> 
 
 def test_missing_headers_are_rejected(tmp_path: Path) -> None:
     headers = list(EXPECTED_TRANSACTION_HEADERS[:-1])
+
+    with pytest.raises(TransactionExportError, match="missing_csv_headers"):
+        consume(write_archive(tmp_path, headers=headers))
+
+
+def test_recipient_name_header_remains_required(tmp_path: Path) -> None:
+    headers = [
+        header for header in EXPECTED_TRANSACTION_HEADERS if header != "recipient_name"
+    ]
 
     with pytest.raises(TransactionExportError, match="missing_csv_headers"):
         consume(write_archive(tmp_path, headers=headers))
