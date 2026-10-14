@@ -295,6 +295,284 @@ def test_polling_moves_from_pending_to_complete_and_respects_numeric_retry_after
     assert sleeps == [12.0]
 
 
+def test_initial_status_404_grace_retries_same_url_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            httpx.Response(404),
+            httpx.Response(
+                200,
+                json={
+                    "status": "finished",
+                    "file_url": job().file_url,
+                    "file_name": "x.zip",
+                    "total_rows": 1,
+                },
+            ),
+        ]
+    )
+    requested: list[tuple[str, str]] = []
+    sleeps: list[float] = []
+    elapsed = 0.0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append((request.method, str(request.url)))
+        return next(responses)
+
+    async def sleeper(seconds: float) -> None:
+        nonlocal elapsed
+        sleeps.append(seconds)
+        elapsed += seconds
+
+    client = async_client_with_transport(monkeypatch, handler)
+    completed = run(
+        client.poll_bulk_export(
+            job(),
+            initial_status_404_grace=True,
+            sleeper=sleeper,
+            monotonic=lambda: elapsed,
+        )
+    )
+
+    assert completed.status == "finished"
+    assert requested == [("GET", job().status_url), ("GET", job().status_url)]
+    assert sleeps == [1.0]
+
+
+def test_initial_status_404_grace_uses_fixed_schedule_then_exhausts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_urls: list[str] = []
+    sleeps: list[float] = []
+    elapsed = 0.0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(404)
+
+    async def sleeper(seconds: float) -> None:
+        nonlocal elapsed
+        sleeps.append(seconds)
+        elapsed += seconds
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="^http_404$"):
+        run(
+            client.poll_bulk_export(
+                job(),
+                initial_status_404_grace=True,
+                sleeper=sleeper,
+                monotonic=lambda: elapsed,
+            )
+        )
+
+    assert requested_urls == [job().status_url] * 4
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_initial_status_404_grace_ceiling_prevents_another_wait_or_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+    clock_values = iter([0.0, 15.0])
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(404)
+
+    async def sleeper(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="^http_404$"):
+        run(
+            client.poll_bulk_export(
+                job(),
+                initial_status_404_grace=True,
+                sleeper=sleeper,
+                monotonic=lambda: next(clock_values),
+            )
+        )
+
+    assert calls == 1
+    assert sleeps == []
+
+
+def test_initial_status_404_grace_cancels_in_flight_retry_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.usaspending.client.INITIAL_STATUS_404_RETRY_DELAYS_SECONDS",
+        (0.0, 2.0, 4.0),
+    )
+    monkeypatch.setattr(
+        "app.usaspending.client.INITIAL_STATUS_404_GRACE_SECONDS",
+        0.1,
+    )
+
+    async def exercise() -> None:
+        requested: list[tuple[str, str]] = []
+        sleeps: list[float] = []
+        retry_started = asyncio.Event()
+        retry_cancelled = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requested.append((request.method, str(request.url)))
+            if len(requested) == 1:
+                return httpx.Response(404)
+            retry_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                retry_cancelled.set()
+                raise
+
+        async def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+            await asyncio.sleep(0)
+
+        client = async_client_with_transport(monkeypatch, handler)
+
+        with pytest.raises(UsaSpendingError, match="^http_404$"):
+            await client.poll_bulk_export(
+                job(),
+                initial_status_404_grace=True,
+                sleeper=sleeper,
+            )
+
+        assert retry_started.is_set()
+        assert retry_cancelled.is_set()
+        assert requested == [("GET", job().status_url)] * 2
+        assert sleeps == [0.0]
+        assert all(url != job().file_url for _, url in requested)
+
+    run(exercise())
+
+
+def test_initial_status_404_grace_stops_after_any_successful_status_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            httpx.Response(200, json={"status": "running"}),
+            httpx.Response(404),
+        ]
+    )
+    calls = 0
+    sleeps: list[float] = []
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    async def sleeper(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="^http_404$"):
+        run(
+            client.poll_bulk_export(
+                job(),
+                initial_status_404_grace=True,
+                poll_initial_seconds=3.0,
+                sleeper=sleeper,
+            )
+        )
+
+    assert calls == 2
+    assert sleeps == [3.0]
+
+
+def test_initial_status_404_grace_is_default_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(404)
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="^http_404$"):
+        run(client.poll_bulk_export(job()))
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status_code", [400, 403, 429, 500])
+def test_initial_status_404_grace_does_not_change_other_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status_code)
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match=f"^http_{status_code}$"):
+        run(client.poll_bulk_export(job(), initial_status_404_grace=True))
+
+    assert calls == 1
+
+
+def test_initial_status_404_grace_rejects_non_boolean_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_request(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid configuration must fail before a request")
+
+    client = async_client_with_transport(monkeypatch, unexpected_request)
+
+    with pytest.raises(UsaSpendingError, match="^invalid_poll_configuration$"):
+        run(
+            client.poll_bulk_export(
+                job(),
+                initial_status_404_grace=1,  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_overall_poll_timeout_wins_during_initial_status_404_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(404)
+
+    async def blocking_sleeper(_: float) -> None:
+        await asyncio.Event().wait()
+
+    client = async_client_with_transport(monkeypatch, handler)
+
+    with pytest.raises(UsaSpendingError, match="^bulk_export_timeout$"):
+        run(
+            client.poll_bulk_export(
+                job(),
+                initial_status_404_grace=True,
+                poll_timeout_seconds=0.01,
+                sleeper=blocking_sleeper,
+            )
+        )
+
+    assert calls == 1
+
+
 def test_polling_respects_http_date_retry_after_beyond_backoff_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

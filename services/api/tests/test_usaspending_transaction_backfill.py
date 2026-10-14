@@ -1065,6 +1065,7 @@ class _SyntheticMultiPeriodClient:
         }
         self._jobs: dict[str, tuple[date, date]] = {}
         self.submissions: list[tuple[date, date]] = []
+        self.poll_grace_values: list[bool] = []
 
     def get_expected_transaction_count(self, start: date, end: date) -> int:
         assert (start, end) in self._archives
@@ -1088,8 +1089,14 @@ class _SyntheticMultiPeriodClient:
             file_name="synthetic.zip",
         )
 
-    async def poll_bulk_export(self, job: BulkExportJob) -> BulkExportStatus:
+    async def poll_bulk_export(
+        self,
+        job: BulkExportJob,
+        *,
+        initial_status_404_grace: bool = False,
+    ) -> BulkExportStatus:
         assert job.status_url in self._jobs
+        self.poll_grace_values.append(initial_status_404_grace)
         return BulkExportStatus(
             status="finished",
             status_url=job.status_url,
@@ -1116,6 +1123,7 @@ class _RestartClient:
     def __init__(self, period: FiscalPeriod) -> None:
         self.archive = _synthetic_archive(period)
         self.poll_calls = 0
+        self.poll_grace_values: list[bool] = []
         self.download_calls = 0
 
     def get_expected_transaction_count(self, _start: date, _end: date) -> int:
@@ -1124,8 +1132,14 @@ class _RestartClient:
     def submit_bulk_export(self, _start: date, _end: date) -> BulkExportJob:
         pytest.fail("restart must not resubmit")
 
-    async def poll_bulk_export(self, job: BulkExportJob) -> BulkExportStatus:
+    async def poll_bulk_export(
+        self,
+        job: BulkExportJob,
+        *,
+        initial_status_404_grace: bool = False,
+    ) -> BulkExportStatus:
         self.poll_calls += 1
+        self.poll_grace_values.append(initial_status_404_grace)
         return BulkExportStatus(
             status="finished",
             status_url=job.status_url,
@@ -1259,6 +1273,7 @@ def test_coordinator_restart_uses_real_storage_guard_before_activity(
     if resume_status == "submitted":
         assert DEFAULT_MAX_ROWS in guard.checked_rows
     assert client.poll_calls == (1 if resume_status == "submitted" else 0)
+    assert client.poll_grace_values == ([False] if resume_status == "submitted" else [])
     assert client.download_calls == 1
 
 
@@ -1504,6 +1519,7 @@ def test_synthetic_multi_fiscal_year_coordinator_client_parser_loader_flow(
     assert result.status == "completed"
     assert result.submitted_leaves == len(roots)
     assert client.submissions == [(root.start, root.end) for root in roots]
+    assert client.poll_grace_values == [True] * len(roots)
     with engine.connect() as connection:
         assert connection.scalar(
             select(func.count()).select_from(UsaSpendingTransaction)

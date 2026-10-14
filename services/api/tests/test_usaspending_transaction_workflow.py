@@ -8,7 +8,7 @@ import os
 import tempfile
 import threading
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -101,6 +101,7 @@ class StubClient:
         pre_submission_rows: int = 1,
         export_rows: int = 1,
         export_columns: int | None = 16,
+        poll_observer: Callable[[BulkExportJob, bool], None] | None = None,
     ) -> None:
         self.archive = archive
         self.count_error = count_error
@@ -110,9 +111,11 @@ class StubClient:
         self.pre_submission_rows = pre_submission_rows
         self.export_rows = export_rows
         self.export_columns = export_columns
+        self.poll_observer = poll_observer
         self.count_calls = 0
         self.submit_calls = 0
         self.poll_calls = 0
+        self.poll_grace_values: list[bool] = []
         self.download_calls = 0
         self.destinations: list[Path] = []
         self._lock = threading.Lock()
@@ -137,10 +140,18 @@ class StubClient:
             file_name=REMOTE_FILE_NAME,
         )
 
-    async def poll_bulk_export(self, job: BulkExportJob) -> BulkExportStatus:
+    async def poll_bulk_export(
+        self,
+        job: BulkExportJob,
+        *,
+        initial_status_404_grace: bool = False,
+    ) -> BulkExportStatus:
         assert job.status_url == STATUS_URL
         with self._lock:
             self.poll_calls += 1
+            self.poll_grace_values.append(initial_status_404_grace)
+        if self.poll_observer is not None:
+            self.poll_observer(job, initial_status_404_grace)
         if self.poll_error is not None:
             raise self.poll_error
         return BulkExportStatus(
@@ -500,6 +511,7 @@ def test_submission_observer_fires_after_durable_submitted_transition(
     tmp_path: Path,
 ) -> None:
     observed_statuses: list[str] = []
+    observed_poll_metadata: list[tuple[str, str, str, str, bool]] = []
 
     def observe_submission() -> None:
         with disposable_postgres_engine.connect() as connection:
@@ -509,7 +521,24 @@ def test_submission_observer_fires_after_durable_submitted_transition(
         assert isinstance(status, str)
         observed_statuses.append(status)
 
-    client = StubClient(archive=archive_bytes())
+    def observe_poll(job: BulkExportJob, grace_enabled: bool) -> None:
+        with disposable_postgres_engine.connect() as connection:
+            persisted = connection.execute(
+                select(
+                    UsaSpendingTransactionIngestionAttempt.status,
+                    UsaSpendingTransactionIngestionAttempt.status_url,
+                    UsaSpendingTransactionIngestionAttempt.file_url,
+                    UsaSpendingTransactionIngestionAttempt.remote_file_name,
+                )
+            ).one()
+        observed_poll_metadata.append((*persisted, grace_enabled))
+        assert (job.status_url, job.file_url, job.file_name) == (
+            persisted.status_url,
+            persisted.file_url,
+            persisted.remote_file_name,
+        )
+
+    client = StubClient(archive=archive_bytes(), poll_observer=observe_poll)
     subject = workflow(
         disposable_postgres_engine,
         client,
@@ -525,6 +554,9 @@ def test_submission_observer_fires_after_durable_submitted_transition(
 
     assert result.status == "completed"
     assert observed_statuses == ["submitted"]
+    assert observed_poll_metadata == [
+        ("submitted", STATUS_URL, FILE_URL, REMOTE_FILE_NAME, True)
+    ]
     assert client.submit_calls == 1
 
 
@@ -967,7 +999,75 @@ def test_resumes_every_persisted_post_submission_state_without_resubmitting(
     assert result.status == "completed"
     assert client.submit_calls == 0
     assert client.poll_calls == (1 if resume_status == "submitted" else 0)
+    assert client.poll_grace_values == ([False] if resume_status == "submitted" else [])
     assert client.download_calls == 1
+
+
+@pytest.mark.integration
+def test_fresh_submission_404_exhaustion_preserves_metadata_without_download(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = disposable_postgres_engine
+    client = StubClient(
+        archive=archive_bytes(),
+        poll_error=UsaSpendingError("http_404"),
+    )
+
+    result = run_period(
+        workflow(
+            engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+            loader=ExplodingLoader(),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "http_404"
+    assert client.submit_calls == 1
+    assert client.poll_calls == 1
+    assert client.poll_grace_values == [True]
+    assert client.download_calls == 0
+    with engine.connect() as connection:
+        persisted = connection.execute(
+            select(
+                UsaSpendingTransactionIngestionAttempt.status,
+                UsaSpendingTransactionIngestionAttempt.status_url,
+                UsaSpendingTransactionIngestionAttempt.file_url,
+                UsaSpendingTransactionIngestionAttempt.remote_file_name,
+            )
+        ).one()
+    assert persisted == ("failed", STATUS_URL, FILE_URL, REMOTE_FILE_NAME)
+
+
+@pytest.mark.integration
+def test_resumed_submission_404_is_terminal_without_grace_or_resubmission(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = disposable_postgres_engine
+    seed_attempt(engine, "submitted")
+    client = StubClient(
+        archive=archive_bytes(),
+        poll_error=UsaSpendingError("http_404"),
+    )
+
+    result = run_period(
+        workflow(
+            engine,
+            client,
+            TrackingTemporaryDirectories(tmp_path),
+            loader=ExplodingLoader(),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "http_404"
+    assert client.submit_calls == 0
+    assert client.poll_calls == 1
+    assert client.poll_grace_values == [False]
+    assert client.download_calls == 0
 
 
 @pytest.mark.integration

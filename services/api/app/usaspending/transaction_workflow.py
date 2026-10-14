@@ -322,7 +322,10 @@ class TransactionIngestionWorkflow:
                         guarded_restart_without_export_rows = True
                     try:
                         job = self._job_from_attempt(attempt)
-                        completed = await self._client.poll_bulk_export(job)
+                        completed = await self._client.poll_bulk_export(
+                            job,
+                            initial_status_404_grace=submitted_in_this_invocation,
+                        )
                     except _DeterministicFailure as error:
                         attempt = self._mark_failed(
                             attempt,

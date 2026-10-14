@@ -26,6 +26,8 @@ BULK_EXPORT_ENDPOINT = "/api/v2/bulk_download/awards/"
 MAX_REDIRECTS = 5
 DEFAULT_MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 DEFAULT_TRANSFER_TIMEOUT_SECONDS = 3600.0
+INITIAL_STATUS_404_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
+INITIAL_STATUS_404_GRACE_SECONDS = 15.0
 PRIME_CONTRACT_AWARD_TYPES = ("A", "B", "C", "D")
 BULK_TRANSACTION_FIELDS = (
     "contract_transaction_unique_key",
@@ -199,10 +201,14 @@ class UsaSpendingClient:
         poll_initial_seconds: float = 10.0,
         poll_max_seconds: float = 60.0,
         poll_timeout_seconds: float = 3600.0,
+        initial_status_404_grace: bool = False,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
         utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> BulkExportStatus:
         """Poll an accepted job under one cancellable wall-clock deadline."""
+        if not isinstance(initial_status_404_grace, bool):
+            raise UsaSpendingError("invalid_poll_configuration")
         self._validate_poll_configuration(
             poll_initial_seconds,
             poll_max_seconds,
@@ -210,16 +216,72 @@ class UsaSpendingClient:
         )
         self._validate_remote_url(job.status_url, {API_HOST}, "status")
         interval = poll_initial_seconds
+        successful_status_response = False
+        initial_404_retry_index = 0
+        initial_404_error: UsaSpendingError | None = None
+        initial_404_deadline = (
+            monotonic() + INITIAL_STATUS_404_GRACE_SECONDS
+            if initial_status_404_grace
+            else None
+        )
 
         try:
-            async with asyncio.timeout(poll_timeout_seconds):
+            async with asyncio.timeout(poll_timeout_seconds) as overall_timeout:
                 while True:
-                    payload, retry_after = await self._async_request_json(
+                    request_timeout: float | None = None
+                    if initial_404_error is not None:
+                        assert initial_404_deadline is not None
+                        request_timeout = initial_404_deadline - monotonic()
+                        if request_timeout <= 0:
+                            raise initial_404_error
+                    request = self._async_request_json(
                         "GET",
                         job.status_url,
                         allowed_hosts={API_HOST},
                         url_category="status",
                     )
+                    try:
+                        if request_timeout is None:
+                            payload, retry_after = await request
+                        else:
+                            try:
+                                payload, retry_after = await asyncio.wait_for(
+                                    request,
+                                    timeout=request_timeout,
+                                )
+                            except TimeoutError:
+                                if overall_timeout.expired():
+                                    raise
+                                raise initial_404_error
+                        successful_status_response = True
+                        initial_404_error = None
+                    except UsaSpendingError as error:
+                        if (
+                            str(error) != "http_404"
+                            or not initial_status_404_grace
+                            or successful_status_response
+                            or initial_404_retry_index
+                            >= len(INITIAL_STATUS_404_RETRY_DELAYS_SECONDS)
+                        ):
+                            raise
+                        assert initial_404_deadline is not None
+                        delay = INITIAL_STATUS_404_RETRY_DELAYS_SECONDS[
+                            initial_404_retry_index
+                        ]
+                        remaining = initial_404_deadline - monotonic()
+                        if remaining <= delay:
+                            raise
+                        initial_404_retry_index += 1
+                        initial_404_error = error
+                        try:
+                            await asyncio.wait_for(sleeper(delay), timeout=remaining)
+                        except TimeoutError:
+                            if overall_timeout.expired():
+                                raise
+                            raise error
+                        if monotonic() >= initial_404_deadline:
+                            raise error
+                        continue
                     raw_status = payload.get("status")
                     if not isinstance(raw_status, str) or not raw_status.strip():
                         raise UsaSpendingError("invalid_bulk_export_status")
