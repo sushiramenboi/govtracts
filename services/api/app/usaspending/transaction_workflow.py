@@ -483,16 +483,14 @@ class TransactionIngestionWorkflow:
         except SQLAlchemyError:
             raise TransactionWorkflowError("database_operation_failed") from None
 
+        if attempt.get("recovery_of_attempt_id") is not None:
+            raise TransactionWorkflowError("recovery_authorization_required")
+
         submission_claimed = False
-        local_archive: Path | None = None
-        local_sha256: str | None = None
-        local_bytes: int | None = None
-        guarded_export_rows: int | None = None
-        guarded_restart_without_export_rows = False
         submitted_in_this_invocation = False
 
-        with ExitStack() as resources:
-            for _ in range(12):
+        with ExitStack():
+            for transition_index in range(12):
                 status = attempt["status"]
                 if status == "completed":
                     return self._result(attempt)
@@ -600,12 +598,117 @@ class TransactionIngestionWorkflow:
                         submission_observer()
                     continue
 
+                if status in {"submitted", "export_finished", "archive_hashed", "loading"}:
+                    return await self._resume_persisted_attempt(
+                        attempt,
+                        fiscal_year=fiscal_year,
+                        period_start=period_start,
+                        period_end=period_end,
+                        capacity_guard=capacity_guard,
+                        initial_status_404_grace=submitted_in_this_invocation,
+                        require_persisted_identity=False,
+                        max_transitions=12 - transition_index,
+                    )
+
+                raise TransactionWorkflowError("invalid_attempt_state")
+
+        raise TransactionWorkflowError("workflow_transition_limit_exceeded")
+
+    async def resume_failed_job_recovery(
+        self,
+        *,
+        recovery_attempt_id: UUID,
+        expected_failed_attempt_id: UUID,
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+        capacity_guard: CapacityGuard | None = None,
+    ) -> TransactionWorkflowResult:
+        """Resume one exact persisted recovery job without a new export submission."""
+        if not isinstance(recovery_attempt_id, UUID):
+            raise TransactionWorkflowError("invalid_recovery_attempt_id")
+        if not isinstance(expected_failed_attempt_id, UUID):
+            raise TransactionWorkflowError("invalid_failed_attempt_id")
+        if capacity_guard is not None and not callable(capacity_guard):
+            raise TransactionWorkflowError("invalid_capacity_guard")
+        try:
+            validate_subperiod(fiscal_year, period_start, period_end)
+        except (TypeError, ValueError):
+            raise TransactionWorkflowError("invalid_fiscal_period") from None
+
+        try:
+            with self._engine.begin() as connection:
+                source = self._claim_source_on_connection(
+                    connection,
+                    expected_failed_attempt_id,
+                    fiscal_year,
+                    period_start,
+                    period_end,
+                )
+                row = connection.execute(
+                    select(self._attempts)
+                    .where(self._attempts.c.id == recovery_attempt_id)
+                    .with_for_update()
+                ).mappings().one_or_none()
+                if row is None:
+                    raise TransactionWorkflowError("recovery_attempt_not_found")
+                recovery = dict(row)
+                if recovery["recovery_of_attempt_id"] != source["id"]:
+                    raise TransactionWorkflowError("recovery_lineage_mismatch")
+                self._validate_linked_recovery(connection, source, recovery)
+                if recovery["status"] != "completed":
+                    self._require_empty_recovery_period(connection, source)
+                try:
+                    job = self._job_from_attempt(recovery)
+                    self._client.validate_persisted_bulk_export_job(job)
+                except (_DeterministicFailure, UsaSpendingError, TypeError, ValueError):
+                    raise TransactionWorkflowError("recovery_job_unsafe") from None
+        except SQLAlchemyError:
+            raise TransactionWorkflowError("database_operation_failed") from None
+
+        if recovery["status"] == "completed":
+            return self._result(recovery)
+        return await self._resume_persisted_attempt(
+            recovery,
+            fiscal_year=fiscal_year,
+            period_start=period_start,
+            period_end=period_end,
+            capacity_guard=capacity_guard,
+            initial_status_404_grace=False,
+            require_persisted_identity=True,
+        )
+
+    async def _resume_persisted_attempt(
+        self,
+        attempt: AttemptRow,
+        *,
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+        capacity_guard: CapacityGuard | None,
+        initial_status_404_grace: bool,
+        require_persisted_identity: bool,
+        max_transitions: int = 12,
+    ) -> TransactionWorkflowResult:
+        """Advance an already-selected submitted job through persisted states."""
+        local_archive: Path | None = None
+        local_sha256: str | None = None
+        local_bytes: int | None = None
+        guarded_export_rows: int | None = None
+        guarded_restart_without_export_rows = False
+
+        with ExitStack() as resources:
+            for _ in range(max_transitions):
+                status = attempt["status"]
+                if status in TERMINAL_STATUSES:
+                    return self._result(attempt)
+
                 if status == "submitted":
                     if (
                         capacity_guard is not None
                         and not guarded_restart_without_export_rows
                         and attempt.get("export_rows") is None
-                        and not submitted_in_this_invocation
+                        and not initial_status_404_grace
                     ):
                         capacity_guard(DEFAULT_MAX_ROWS)
                         guarded_restart_without_export_rows = True
@@ -613,7 +716,7 @@ class TransactionIngestionWorkflow:
                         job = self._job_from_attempt(attempt)
                         completed = await self._client.poll_bulk_export(
                             job,
-                            initial_status_404_grace=submitted_in_this_invocation,
+                            initial_status_404_grace=initial_status_404_grace,
                         )
                     except _DeterministicFailure as error:
                         attempt = self._mark_failed(
@@ -639,6 +742,18 @@ class TransactionIngestionWorkflow:
                                 code=code,
                                 detail="Bulk export ended in a deterministic failure.",
                             )
+                        return self._result(attempt)
+                    if require_persisted_identity and (
+                        completed.status_url != attempt["status_url"]
+                        or completed.file_url != attempt["file_url"]
+                        or completed.file_name != attempt["remote_file_name"]
+                    ):
+                        attempt = self._mark_failed(
+                            attempt,
+                            expected_status="submitted",
+                            code="recovery_job_identity_mismatch",
+                            detail="Persisted recovery job identity changed.",
+                        )
                         return self._result(attempt)
                     attempt, transitioned, database_failed = self._transition_safely(
                         attempt,

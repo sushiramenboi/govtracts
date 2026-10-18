@@ -935,6 +935,461 @@ def test_two_workers_claim_one_recovery_without_mutating_source(
 
 
 @pytest.mark.integration
+def test_resume_submitted_recovery_polls_persisted_job(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    source = _seed_claim_source(engine)
+    claim = _claim(engine, source["id"])
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.connect() as connection:
+        original = dict(connection.execute(
+            select(attempts).where(attempts.c.id == source["id"])
+        ).mappings().one())
+
+    class RecoveryPollClient(ClaimOnlyClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.polled: list[tuple[BulkExportJob, bool]] = []
+
+        async def poll_bulk_export(
+            self,
+            job: BulkExportJob,
+            *,
+            initial_status_404_grace: bool = False,
+        ) -> BulkExportStatus:
+            self.polled.append((job, initial_status_404_grace))
+            raise UsaSpendingError("timeout_or_network")
+
+    client = RecoveryPollClient()
+    subject = TransactionIngestionWorkflow(
+        engine,
+        client,
+        ExplodingLoader(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+        temporary_directory_factory=lambda: pytest.fail("unexpected filesystem"),
+    )
+    result = run(subject.resume_failed_job_recovery(
+        recovery_attempt_id=claim.recovery_attempt_id,
+        expected_failed_attempt_id=source["id"],
+        fiscal_year=FISCAL_YEAR,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+    ))
+
+    assert result.attempt_id == claim.recovery_attempt_id
+    assert result.status == "submitted"
+    assert result.error_code == "timeout_or_network"
+    assert client.polled == [(
+        BulkExportJob(CLAIM_STATUS_URL, CLAIM_FILE_URL, CLAIM_FILE_NAME), False
+    )]
+    with engine.connect() as connection:
+        after = dict(connection.execute(
+            select(attempts).where(attempts.c.id == source["id"])
+        ).mappings().one())
+    assert after == original
+
+
+class RecoveryResumeClient(ClaimOnlyClient):
+    def __init__(
+        self,
+        *,
+        archive: bytes | None = None,
+        poll_error: UsaSpendingError | None = None,
+        download_error: UsaSpendingError | None = None,
+        returned_identity: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.archive = archive if archive is not None else archive_bytes()
+        self.poll_error = poll_error
+        self.download_error = download_error
+        self.returned_identity = returned_identity or {}
+        self.polled: list[tuple[BulkExportJob, bool]] = []
+        self.downloaded: list[BulkExportStatus] = []
+
+    async def poll_bulk_export(
+        self,
+        job: BulkExportJob,
+        *,
+        initial_status_404_grace: bool = False,
+    ) -> BulkExportStatus:
+        self.polled.append((job, initial_status_404_grace))
+        if self.poll_error is not None:
+            raise self.poll_error
+        return BulkExportStatus(
+            status="finished",
+            status_url=self.returned_identity.get("status_url", job.status_url),
+            file_url=self.returned_identity.get("file_url", job.file_url),
+            file_name=self.returned_identity.get("file_name", job.file_name),
+            total_rows=1,
+            total_columns=16,
+            message=None,
+            seconds_elapsed="1.0",
+        )
+
+    async def retrieve_bulk_export(
+        self,
+        completed: BulkExportStatus,
+        destination: str | os.PathLike[str],
+        **_: Any,
+    ) -> int:
+        self.downloaded.append(completed)
+        if self.download_error is not None:
+            raise self.download_error
+        Path(destination).write_bytes(self.archive)
+        return len(self.archive)
+
+
+def _recovery_row(engine: Any, attempt_id: UUID) -> dict[str, Any]:
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.connect() as connection:
+        return dict(connection.execute(
+            select(attempts).where(attempts.c.id == attempt_id)
+        ).mappings().one())
+
+
+def _claimed_recovery(engine: Any) -> tuple[UUID, UUID, dict[str, Any]]:
+    source = _seed_claim_source(engine)
+    claim = _claim(engine, source["id"])
+    return source["id"], claim.recovery_attempt_id, _recovery_row(engine, source["id"])
+
+
+def _resume_subject(
+    engine: Any,
+    client: RecoveryResumeClient | ClaimOnlyClient,
+    tmp_path: Path,
+    *,
+    loader: Any | None = None,
+) -> TransactionIngestionWorkflow:
+    return workflow(
+        engine,
+        client,
+        TrackingTemporaryDirectories(tmp_path),
+        loader=loader,
+    )
+
+
+def _resume_exact(
+    subject: TransactionIngestionWorkflow,
+    recovery_id: UUID,
+    source_id: UUID,
+    *,
+    capacity_guard: Any | None = None,
+) -> Any:
+    return run(subject.resume_failed_job_recovery(
+        recovery_attempt_id=recovery_id,
+        expected_failed_attempt_id=source_id,
+        fiscal_year=FISCAL_YEAR,
+        period_start=PERIOD_START,
+        period_end=PERIOD_END,
+        capacity_guard=capacity_guard,
+    ))
+
+
+def test_recovery_resume_source_has_no_submission_or_location_call_path() -> None:
+    import ast
+    import inspect
+    import textwrap
+
+    forbidden = {
+        "run_period", "_locate_or_create_attempt", "claim_failed_job_recovery",
+        "get_expected_transaction_count", "submit_bulk_export",
+    }
+    for method in (
+        TransactionIngestionWorkflow.resume_failed_job_recovery,
+        TransactionIngestionWorkflow._resume_persisted_attempt,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert calls.isdisjoint(forbidden)
+
+
+@pytest.mark.integration
+def test_ordinary_run_period_rejects_selected_recovery_without_io(
+    disposable_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    recovery_before = _recovery_row(engine, recovery_id)
+    subject = _resume_subject(engine, ClaimOnlyClient(), tmp_path, loader=ExplodingLoader())
+    with pytest.raises(TransactionWorkflowError, match="^recovery_authorization_required$"):
+        run_child_period(subject, period_start=PERIOD_START, period_end=PERIOD_END)
+    assert _recovery_row(engine, source_id) == original
+    assert _recovery_row(engine, recovery_id) == recovery_before
+
+
+@pytest.mark.parametrize(
+    "recovery_id,source_id,year,start,end,guard,code",
+    [
+        ("bad", uuid4(), FISCAL_YEAR, PERIOD_START, PERIOD_END, None, "invalid_recovery_attempt_id"),
+        (uuid4(), "bad", FISCAL_YEAR, PERIOD_START, PERIOD_END, None, "invalid_failed_attempt_id"),
+        (uuid4(), uuid4(), 2024, PERIOD_START, PERIOD_END, None, "invalid_fiscal_period"),
+        (uuid4(), uuid4(), FISCAL_YEAR, PERIOD_END, PERIOD_START, None, "invalid_fiscal_period"),
+        (uuid4(), uuid4(), FISCAL_YEAR, PERIOD_START, PERIOD_END, 3, "invalid_capacity_guard"),
+    ],
+)
+def test_recovery_resume_invalid_inputs_precede_database(
+    recovery_id: Any, source_id: Any, year: Any, start: Any, end: Any,
+    guard: Any, code: str,
+) -> None:
+    fake = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    subject = TransactionIngestionWorkflow(  # type: ignore[arg-type]
+        fake, ClaimOnlyClient(), ExplodingLoader(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(TransactionWorkflowError, match=f"^{code}$"):
+        run(subject.resume_failed_job_recovery(
+            recovery_attempt_id=recovery_id,
+            expected_failed_attempt_id=source_id,
+            fiscal_year=year,
+            period_start=start,
+            period_end=end,
+            capacity_guard=guard,
+        ))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "case,code",
+    [
+        ("missing_recovery", "recovery_attempt_not_found"),
+        ("wrong_source", "recovery_source_ineligible"),
+        ("wrong_bounds", "recovery_source_ineligible"),
+        ("wrong_lineage", "recovery_lineage_mismatch"),
+        ("illegal_state", "recovery_link_invalid"),
+        ("changed_persisted_identity", "recovery_link_invalid"),
+    ],
+)
+def test_recovery_resume_selection_fails_before_client_io(
+    disposable_postgres_engine: Any, tmp_path: Path, case: str, code: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    expected_id = source_id
+    selected_id = recovery_id
+    start, end = PERIOD_START, PERIOD_END
+    if case == "missing_recovery":
+        selected_id = uuid4()
+    elif case == "wrong_source":
+        expected_id = uuid4()
+    elif case == "wrong_bounds":
+        end = date(2024, 10, 16)
+    elif case == "wrong_lineage":
+        alternate = claim_source_values()
+        with engine.begin() as connection:
+            connection.execute(attempts.insert(), alternate)
+            connection.execute(attempts.update().where(
+                attempts.c.id == recovery_id
+            ).values(recovery_of_attempt_id=alternate["id"]))
+    elif case == "illegal_state":
+        with engine.begin() as connection:
+            connection.execute(attempts.update().where(
+                attempts.c.id == recovery_id
+            ).values(status="counted"))
+    elif case == "changed_persisted_identity":
+        with engine.begin() as connection:
+            connection.execute(attempts.update().where(
+                attempts.c.id == recovery_id
+            ).values(file_url="https://files.usaspending.gov/generated_downloads/other.zip"))
+    subject = _resume_subject(engine, ClaimOnlyClient(), tmp_path, loader=ExplodingLoader())
+    with pytest.raises(TransactionWorkflowError, match=f"^{code}$"):
+        run(subject.resume_failed_job_recovery(
+            recovery_attempt_id=selected_id,
+            expected_failed_attempt_id=expected_id,
+            fiscal_year=FISCAL_YEAR,
+            period_start=start,
+            period_end=end,
+        ))
+    assert _recovery_row(engine, source_id) == original
+
+
+@pytest.mark.integration
+def test_recovery_resume_running_then_finishes_same_job_once(
+    disposable_postgres_engine: Any, tmp_path: Path,
+) -> None:
+    from app.usaspending.transaction_export import DEFAULT_MAX_ROWS
+
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    first_client = RecoveryResumeClient(poll_error=UsaSpendingError("timeout_or_network"))
+    first = _resume_exact(_resume_subject(engine, first_client, tmp_path), recovery_id, source_id)
+    assert first.status == "submitted"
+    assert first.error_code == "timeout_or_network"
+    assert first_client.polled == [(
+        BulkExportJob(CLAIM_STATUS_URL, CLAIM_FILE_URL, CLAIM_FILE_NAME), False
+    )]
+    assert first_client.downloaded == []
+    assert _recovery_row(engine, source_id) == original
+
+    guard_calls: list[int] = []
+    second_client = RecoveryResumeClient()
+    second = _resume_exact(
+        _resume_subject(engine, second_client, tmp_path), recovery_id, source_id,
+        capacity_guard=guard_calls.append,
+    )
+    assert second.attempt_id == recovery_id
+    assert second.status == "completed"
+    assert second.loaded_rows == 1
+    assert second.checkpoint_id is not None
+    assert guard_calls == [DEFAULT_MAX_ROWS, 1]
+    assert second_client.polled == [(
+        BulkExportJob(CLAIM_STATUS_URL, CLAIM_FILE_URL, CLAIM_FILE_NAME), False
+    )]
+    assert len(second_client.downloaded) == 1
+    assert _recovery_row(engine, source_id) == original
+    assert _recovery_row(engine, recovery_id)["status"] == "completed"
+    assert _resume_exact(
+        _resume_subject(engine, ClaimOnlyClient(), tmp_path, loader=ExplodingLoader()),
+        recovery_id, source_id,
+    ) == second
+    assert _recovery_row(engine, source_id) == original
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("field", ["status_url", "file_url", "file_name"])
+def test_recovery_resume_rejects_changed_poll_identity_without_download(
+    disposable_postgres_engine: Any, tmp_path: Path, field: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    changed = {
+        "status_url": CLAIM_STATUS_URL + "&changed=1",
+        "file_url": CLAIM_FILE_URL + "?changed=1",
+        "file_name": "other.zip",
+    }
+    client = RecoveryResumeClient(returned_identity={field: changed[field]})
+    result = _resume_exact(_resume_subject(engine, client, tmp_path), recovery_id, source_id)
+    assert result.status == "failed"
+    assert result.error_code == "recovery_job_identity_mismatch"
+    assert client.downloaded == []
+    assert _recovery_row(engine, source_id) == original
+    assert _recovery_row(engine, recovery_id)["status_url"] == CLAIM_STATUS_URL
+    assert _recovery_row(engine, recovery_id)["file_url"] == CLAIM_FILE_URL
+    assert _recovery_row(engine, recovery_id)["remote_file_name"] == CLAIM_FILE_NAME
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("code", ["http_404", "bulk_export_rejected"])
+def test_recovery_resume_poll_failure_isolated_and_terminal(
+    disposable_postgres_engine: Any, tmp_path: Path, code: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    client = RecoveryResumeClient(poll_error=UsaSpendingError(code))
+    result = _resume_exact(_resume_subject(engine, client, tmp_path), recovery_id, source_id)
+    assert result.status == "failed"
+    assert result.error_code == code
+    assert client.polled[0][1] is False
+    assert client.downloaded == []
+    assert _recovery_row(engine, source_id) == original
+    with pytest.raises(TransactionWorkflowError, match="^recovery_link_invalid$"):
+        _resume_exact(
+            _resume_subject(engine, ClaimOnlyClient(), tmp_path, loader=ExplodingLoader()),
+            recovery_id, source_id,
+        )
+    assert _recovery_row(engine, source_id) == original
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("status", ["export_finished", "archive_hashed", "loading"])
+def test_recovery_resume_restarts_post_poll_without_resubmission(
+    disposable_postgres_engine: Any, tmp_path: Path, status: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    archive = archive_bytes()
+    values: dict[str, Any] = {"status": status, "export_rows": 1, "export_columns": 16}
+    if status in {"archive_hashed", "loading"}:
+        values.update(
+            archive_sha256=hashlib.sha256(archive).hexdigest(),
+            archive_bytes=len(archive),
+        )
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.update().where(attempts.c.id == recovery_id).values(**values))
+    client = RecoveryResumeClient(archive=archive)
+    guard_calls: list[int] = []
+    result = _resume_exact(
+        _resume_subject(engine, client, tmp_path), recovery_id, source_id,
+        capacity_guard=guard_calls.append,
+    )
+    assert result.status == "completed"
+    assert client.polled == []
+    assert len(client.downloaded) == 1
+    assert guard_calls == [1]
+    assert _recovery_row(engine, source_id) == original
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("case,expected_status,code", [
+    ("invalid_archive", "failed", "transaction_validation_failed"),
+    ("archive_mismatch", "failed", "archive_sha256_mismatch"),
+    ("download_failure", "export_finished", "bulk_export_destination_error"),
+    ("load_failure", "failed", "transaction_validation_failed"),
+    ("interrupted_load", "loading", "database_operation_failed"),
+])
+def test_recovery_resume_failure_paths_keep_original_immutable(
+    disposable_postgres_engine: Any, tmp_path: Path,
+    case: str, expected_status: str, code: str,
+) -> None:
+    from app.usaspending.transaction_ingestion import TransactionIngestionError
+
+    engine = disposable_postgres_engine
+    source_id, recovery_id, original = _claimed_recovery(engine)
+    archive = b"not-a-zip" if case == "invalid_archive" else archive_bytes()
+    client = RecoveryResumeClient(
+        archive=archive,
+        download_error=(UsaSpendingError("bulk_export_destination_error")
+                        if case == "download_failure" else None),
+    )
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    if case in {"archive_mismatch", "load_failure", "interrupted_load"}:
+        with engine.begin() as connection:
+            connection.execute(attempts.update().where(attempts.c.id == recovery_id).values(
+                status="loading" if case != "archive_mismatch" else "archive_hashed",
+                export_rows=1,
+                export_columns=16,
+                archive_sha256=("a" * 64 if case == "archive_mismatch"
+                                else hashlib.sha256(archive).hexdigest()),
+                archive_bytes=len(archive),
+            ))
+    loader: Any | None = None
+    if case == "load_failure":
+        class InvalidLoader:
+            def load_with_connection(self, *_: Any, **__: Any) -> Any:
+                raise TransactionIngestionError("unsafe-response-details")
+        loader = InvalidLoader()
+    if case == "interrupted_load":
+        class InterruptedLoader:
+            def load_with_connection(self, connection: Any, **kwargs: Any) -> Any:
+                RecordingLoader(loaded_rows=1).load_with_connection(
+                    connection, **kwargs
+                )
+                raise SQLAlchemyError("injected rollback")
+        loader = InterruptedLoader()
+    subject = _resume_subject(engine, client, tmp_path, loader=loader)
+    result = _resume_exact(subject, recovery_id, source_id)
+    assert result.status == expected_status
+    assert result.error_code == code
+    assert _recovery_row(engine, source_id) == original
+    checkpoints = UsaSpendingIngestionCheckpoint.__table__
+    with engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(checkpoints)) == 0
+    if case == "interrupted_load":
+        retry = _resume_exact(
+            _resume_subject(engine, RecoveryResumeClient(archive=archive), tmp_path),
+            recovery_id, source_id,
+        )
+        assert retry.status == "completed"
+        assert _recovery_row(engine, source_id) == original
+
+
+@pytest.mark.integration
 def test_stop_after_count_persists_count_without_submission(
     disposable_postgres_engine: Any,
     tmp_path: Path,
