@@ -12,14 +12,19 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Engine, and_, insert, select, text, update
+from sqlalchemy import Engine, and_, func, insert, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from app.db.models import UsaSpendingTransactionIngestionAttempt
+from app.db.models import (
+    UsaSpendingIngestionCheckpoint,
+    UsaSpendingTransaction,
+    UsaSpendingTransactionIngestionAttempt,
+)
 from app.usaspending.client import (
     BULK_TRANSACTION_FIELDS,
     BulkExportJob,
@@ -101,6 +106,16 @@ class TransactionWorkflowResult:
     operator_resolution_required: bool
 
 
+@dataclass(frozen=True)
+class RecoveryClaim:
+    """An immutable, detached receipt for one already-submitted recovery job."""
+
+    failed_attempt_id: UUID
+    recovery_attempt_id: UUID
+    attempt: Mapping[str, Any]
+    created: bool
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -133,6 +148,280 @@ class TransactionIngestionWorkflow:
         self._clock = clock
         self._temporary_directory_factory = temporary_directory_factory
         self._attempts = UsaSpendingTransactionIngestionAttempt.__table__
+
+    def claim_failed_job_recovery(
+        self,
+        failed_attempt_id: UUID,
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+    ) -> RecoveryClaim:
+        """Atomically claim an eligible failed HTTP-404 job without remote I/O."""
+        if not isinstance(failed_attempt_id, UUID):
+            raise TransactionWorkflowError("invalid_failed_attempt_id")
+        try:
+            validate_subperiod(fiscal_year, period_start, period_end)
+        except (TypeError, ValueError):
+            raise TransactionWorkflowError("invalid_fiscal_period") from None
+
+        lock_key = _attempt_lock_key(SOURCE, period_start, period_end)
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": lock_key},
+                )
+                source = self._claim_source_on_connection(
+                    connection, failed_attempt_id, fiscal_year, period_start, period_end
+                )
+                linked = self._linked_recovery_on_connection(connection, source)
+                if linked is not None:
+                    self._validate_linked_recovery(connection, source, linked)
+                    if linked["status"] != "completed":
+                        self._require_empty_recovery_period(connection, source)
+                    return self._recovery_claim(source, linked, created=False)
+
+                conflict = connection.execute(
+                    select(self._attempts.c.id).where(
+                        self._attempts.c.source == SOURCE,
+                        self._attempts.c.period_start == period_start,
+                        self._attempts.c.period_end == period_end,
+                        self._attempts.c.status.not_in(TERMINAL_STATUSES),
+                    ).limit(1)
+                ).first()
+                if conflict is not None:
+                    raise TransactionWorkflowError("recovery_period_conflict")
+                self._require_empty_recovery_period(connection, source)
+
+                recovery_id = uuid4()
+                now = self._aware_now()
+                connection.execute(
+                    insert(self._attempts),
+                    {
+                        "id": recovery_id,
+                        "source": source["source"],
+                        "fiscal_year": source["fiscal_year"],
+                        "period_start": source["period_start"],
+                        "period_end": source["period_end"],
+                        "status": "submitted",
+                        "expected_rows": source["expected_rows"],
+                        "status_url": source["status_url"],
+                        "file_url": source["file_url"],
+                        "remote_file_name": source["remote_file_name"],
+                        "parent_attempt_id": source["parent_attempt_id"],
+                        "recovery_of_attempt_id": source["id"],
+                        "failure_count": 0,
+                        "started_at": now,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                recovery = self._read_attempt_on_connection(connection, recovery_id)
+                return self._recovery_claim(source, recovery, created=True)
+        except IntegrityError:
+            # The original transaction has rolled back. A concurrent writer may
+            # have won the unique recovery lineage; accept only that exact row.
+            try:
+                with self._engine.begin() as connection:
+                    connection.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
+                    source = self._claim_source_on_connection(
+                        connection, failed_attempt_id, fiscal_year,
+                        period_start, period_end,
+                    )
+                    linked = self._linked_recovery_on_connection(connection, source)
+                    if linked is None:
+                        raise TransactionWorkflowError("recovery_claim_conflict")
+                    self._validate_linked_recovery(connection, source, linked)
+                    if linked["status"] != "completed":
+                        self._require_empty_recovery_period(connection, source)
+                    return self._recovery_claim(source, linked, created=False)
+            except (SQLAlchemyError, TransactionWorkflowError):
+                raise TransactionWorkflowError("recovery_claim_conflict") from None
+        except SQLAlchemyError:
+            raise TransactionWorkflowError("database_operation_failed") from None
+
+    def _claim_source_on_connection(
+        self,
+        connection: Connection,
+        failed_attempt_id: UUID,
+        fiscal_year: int,
+        period_start: date,
+        period_end: date,
+    ) -> AttemptRow:
+        row = connection.execute(
+            select(self._attempts)
+            .where(self._attempts.c.id == failed_attempt_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if row is None:
+            raise TransactionWorkflowError("recovery_source_ineligible")
+        source = dict(row)
+        if (
+            source["source"] != SOURCE
+            or source["fiscal_year"] != fiscal_year
+            or source["period_start"] != period_start
+            or source["period_end"] != period_end
+            or source["status"] != "failed"
+            or source["last_error_code"] != "http_404"
+            or source["completed_at"] is None
+            or source["recovery_of_attempt_id"] is not None
+            or not _valid_recovery_count(source["expected_rows"])
+        ):
+            raise TransactionWorkflowError("recovery_source_ineligible")
+        identity = tuple(source[name] for name in (
+            "status_url", "file_url", "remote_file_name"
+        ))
+        if all(value is None for value in identity):
+            raise TransactionWorkflowError("recovery_job_absent")
+        if not all(_present_string(value) for value in identity):
+            raise TransactionWorkflowError("recovery_job_corrupt")
+        try:
+            self._client.validate_persisted_bulk_export_job(
+                BulkExportJob(identity[0], identity[1], identity[2])
+            )
+        except (UsaSpendingError, TypeError, ValueError):
+            raise TransactionWorkflowError("recovery_job_unsafe") from None
+        if any(source[name] is not None for name in (
+            "export_rows", "export_columns", "archive_sha256", "archive_bytes",
+            "loaded_rows", "signed_obligation_total", "checkpoint_id",
+        )):
+            raise TransactionWorkflowError("recovery_source_dirty")
+        return source
+
+    def _linked_recovery_on_connection(
+        self, connection: Connection, source: Mapping[str, Any]
+    ) -> AttemptRow | None:
+        rows = connection.execute(
+            select(self._attempts)
+            .where(self._attempts.c.recovery_of_attempt_id == source["id"])
+            .limit(2)
+        ).mappings().all()
+        if len(rows) > 1:
+            raise TransactionWorkflowError("recovery_link_conflict")
+        return dict(rows[0]) if rows else None
+
+    def _require_empty_recovery_period(
+        self, connection: Connection, source: Mapping[str, Any]
+    ) -> None:
+        checkpoints = UsaSpendingIngestionCheckpoint.__table__
+        transactions = UsaSpendingTransaction.__table__
+        checkpoint = connection.execute(
+            select(checkpoints.c.id).where(
+                checkpoints.c.source == SOURCE,
+                checkpoints.c.period_start == source["period_start"],
+                checkpoints.c.period_end == source["period_end"],
+            ).limit(1)
+        ).first()
+        transaction = connection.execute(
+            select(transactions.c.stable_transaction_id).where(
+                transactions.c.action_date >= source["period_start"],
+                transactions.c.action_date <= source["period_end"],
+            ).limit(1)
+        ).first()
+        if checkpoint is not None or transaction is not None:
+            raise TransactionWorkflowError("recovery_period_not_empty")
+
+    def _validate_linked_recovery(
+        self,
+        connection: Connection,
+        source: Mapping[str, Any],
+        recovery: Mapping[str, Any],
+    ) -> None:
+        copied = (
+            "source", "fiscal_year", "period_start", "period_end",
+            "parent_attempt_id", "expected_rows", "status_url", "file_url",
+            "remote_file_name",
+        )
+        if (
+            recovery["recovery_of_attempt_id"] != source["id"]
+            or recovery["id"] == source["id"]
+            or any(recovery[name] != source[name] for name in copied)
+            or recovery["status"] not in {
+                "submitted", "export_finished", "archive_hashed", "loading", "completed"
+            }
+        ):
+            raise TransactionWorkflowError("recovery_link_invalid")
+        status = recovery["status"]
+        if status == "submitted":
+            if any(recovery[name] is not None for name in (
+                "export_rows", "export_columns", "archive_sha256", "archive_bytes",
+                "loaded_rows", "signed_obligation_total", "checkpoint_id", "completed_at",
+            )):
+                raise TransactionWorkflowError("recovery_link_invalid")
+            return
+        if (
+            not _valid_recovery_count(recovery["export_rows"])
+            or recovery["export_columns"] not in (None, len(BULK_TRANSACTION_FIELDS))
+        ):
+            raise TransactionWorkflowError("recovery_link_invalid")
+        if status == "export_finished":
+            if any(recovery[name] is not None for name in (
+                "archive_sha256", "archive_bytes", "loaded_rows",
+                "signed_obligation_total", "checkpoint_id", "completed_at",
+            )):
+                raise TransactionWorkflowError("recovery_link_invalid")
+            return
+        if (
+            not isinstance(recovery["archive_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", recovery["archive_sha256"]) is None
+            or not isinstance(recovery["archive_bytes"], int)
+            or isinstance(recovery["archive_bytes"], bool)
+            or recovery["archive_bytes"] < 0
+        ):
+            raise TransactionWorkflowError("recovery_link_invalid")
+        if status in {"archive_hashed", "loading"}:
+            if any(recovery[name] is not None for name in (
+                "loaded_rows", "signed_obligation_total", "checkpoint_id", "completed_at",
+            )):
+                raise TransactionWorkflowError("recovery_link_invalid")
+            return
+        if (
+            recovery["loaded_rows"] != recovery["export_rows"]
+            or not isinstance(recovery["signed_obligation_total"], Decimal)
+            or not isinstance(recovery["checkpoint_id"], UUID)
+            or recovery["completed_at"] is None
+            or recovery["last_error_code"] is not None
+            or recovery["last_error_detail"] is not None
+        ):
+            raise TransactionWorkflowError("recovery_link_invalid")
+        checkpoints = UsaSpendingIngestionCheckpoint.__table__
+        checkpoint = connection.execute(
+            select(checkpoints).where(checkpoints.c.id == recovery["checkpoint_id"])
+        ).mappings().one_or_none()
+        if (
+            checkpoint is None
+            or checkpoint["source"] != SOURCE
+            or checkpoint["fiscal_year"] != source["fiscal_year"]
+            or checkpoint["period_start"] != source["period_start"]
+            or checkpoint["period_end"] != source["period_end"]
+            or checkpoint["status"] != "complete"
+            or checkpoint["loaded_rows"] != recovery["loaded_rows"]
+        ):
+            raise TransactionWorkflowError("recovery_link_invalid")
+        transactions = UsaSpendingTransaction.__table__
+        owned_rows = connection.scalar(
+            select(func.count()).select_from(transactions).where(
+                transactions.c.ingestion_checkpoint_id == recovery["checkpoint_id"],
+                transactions.c.action_date >= source["period_start"],
+                transactions.c.action_date <= source["period_end"],
+            )
+        )
+        if owned_rows != recovery["loaded_rows"]:
+            raise TransactionWorkflowError("recovery_link_invalid")
+
+    @staticmethod
+    def _recovery_claim(
+        source: Mapping[str, Any], recovery: Mapping[str, Any], *, created: bool
+    ) -> RecoveryClaim:
+        return RecoveryClaim(
+            failed_attempt_id=source["id"],
+            recovery_attempt_id=recovery["id"],
+            attempt=MappingProxyType(dict(recovery)),
+            created=created,
+        )
 
     async def run(
         self,
@@ -1045,6 +1334,10 @@ def _archive_identity(path: Path) -> tuple[str, int]:
 
 def _present_string(value: object) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _valid_recovery_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= DEFAULT_MAX_ROWS
 
 
 def _safe_upstream_code(error: UsaSpendingError, default: str) -> str:

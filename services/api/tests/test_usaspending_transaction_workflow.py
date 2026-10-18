@@ -480,6 +480,460 @@ def run_child_period(
     )
 
 
+CLAIM_FILE_NAME = "recovery.zip"
+CLAIM_STATUS_URL = (
+    "https://api.usaspending.gov/api/v2/download/status?file_name=recovery.zip"
+)
+CLAIM_FILE_URL = "https://files.usaspending.gov/generated_downloads/recovery.zip"
+
+
+class ClaimOnlyClient(UsaSpendingClient):
+    def __init__(self) -> None:
+        from app.core.config import Settings
+
+        super().__init__(
+            Settings(database_url="postgresql+psycopg://unused:unused@invalid/unused_test")
+        )
+
+    def get_expected_transaction_count(self, *_: Any, **__: Any) -> Any:
+        pytest.fail("recovery claim attempted a count request")
+
+    def submit_bulk_export(self, *_: Any, **__: Any) -> Any:
+        pytest.fail("recovery claim attempted submission")
+
+    async def poll_bulk_export(self, *_: Any, **__: Any) -> Any:
+        pytest.fail("recovery claim attempted polling")
+
+    async def retrieve_bulk_export(self, *_: Any, **__: Any) -> Any:
+        pytest.fail("recovery claim attempted downloading")
+
+    def _http_client(self, *_: Any, **__: Any) -> Any:
+        pytest.fail("recovery claim opened a sync HTTP client")
+
+    def _async_http_client(self, *_: Any, **__: Any) -> Any:
+        pytest.fail("recovery claim opened an async HTTP client")
+
+
+def claim_workflow(engine: Any) -> TransactionIngestionWorkflow:
+    def no_filesystem() -> Any:
+        pytest.fail("recovery claim accessed the filesystem")
+
+    return TransactionIngestionWorkflow(
+        engine,
+        ClaimOnlyClient(),
+        ExplodingLoader(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+        temporary_directory_factory=no_filesystem,
+    )
+
+
+def claim_source_values(**changes: Any) -> dict[str, Any]:
+    values = attempt_values("failed")
+    values.update(
+        expected_rows=7,
+        status_url=CLAIM_STATUS_URL,
+        file_url=CLAIM_FILE_URL,
+        remote_file_name=CLAIM_FILE_NAME,
+        last_error_code="http_404",
+        failure_count=1,
+    )
+    values.update(changes)
+    return values
+
+
+@pytest.mark.integration
+def test_claim_failed_job_recovery_creates_one_exact_offline_copy(
+    disposable_postgres_engine: Any,
+) -> None:
+    from app.usaspending.transaction_workflow import RecoveryClaim
+
+    engine = disposable_postgres_engine
+    source = claim_source_values()
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.insert(), source)
+        before = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
+
+    claim = claim_workflow(engine).claim_failed_job_recovery(
+        source["id"], FISCAL_YEAR, PERIOD_START, PERIOD_END
+    )
+
+    assert isinstance(claim, RecoveryClaim)
+    assert claim.failed_attempt_id == source["id"]
+    assert claim.recovery_attempt_id != source["id"]
+    assert claim.created is True
+    with engine.connect() as connection:
+        after = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
+        linked = connection.execute(
+            select(attempts).where(attempts.c.recovery_of_attempt_id == source["id"])
+        ).mappings().all()
+    assert after == before
+    assert len(linked) == 1
+    recovery = dict(linked[0])
+    assert recovery["id"] == claim.recovery_attempt_id
+    assert recovery["status"] == "submitted"
+    assert recovery["recovery_of_attempt_id"] == source["id"]
+    assert recovery["failure_count"] == 0
+    for field in (
+        "source", "fiscal_year", "period_start", "period_end", "expected_rows",
+        "status_url", "file_url", "remote_file_name", "parent_attempt_id",
+    ):
+        assert recovery[field] == before[field]
+    for field in (
+        "completed_at", "last_error_code", "last_error_detail", "export_rows",
+        "export_columns", "archive_sha256", "archive_bytes", "loaded_rows",
+        "signed_obligation_total", "checkpoint_id",
+    ):
+        assert recovery[field] is None
+    assert dict(claim.attempt) == recovery
+    with pytest.raises(TypeError):
+        claim.attempt["status"] = "failed"  # type: ignore[index]
+
+
+def _seed_claim_source(engine: Any, **changes: Any) -> dict[str, Any]:
+    values = claim_source_values(**changes)
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), values)
+    return values
+
+
+def _claim(engine: Any, source_id: UUID) -> Any:
+    return claim_workflow(engine).claim_failed_job_recovery(
+        source_id, FISCAL_YEAR, PERIOD_START, PERIOD_END
+    )
+
+
+@pytest.mark.integration
+def test_claim_is_idempotent_and_preserves_parent_and_source_snapshot(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    parent = attempt_values("failed", attempt_id=uuid4())
+    parent.update(period_start=date(2024, 9, 1), period_end=date(2024, 9, 30), fiscal_year=2024)
+    source = claim_source_values(parent_attempt_id=parent["id"])
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.insert(), parent)
+        connection.execute(attempts.insert(), source)
+        original = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
+    first = _claim(engine, source["id"])
+    second = _claim(engine, source["id"])
+    with engine.connect() as connection:
+        after = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
+        linked = connection.execute(select(attempts).where(attempts.c.recovery_of_attempt_id == source["id"])).mappings().all()
+    assert first.created is True and second.created is False
+    assert first.recovery_attempt_id == second.recovery_attempt_id
+    assert len(linked) == 1
+    assert linked[0]["parent_attempt_id"] == parent["id"]
+    assert linked[0]["recovery_of_attempt_id"] == source["id"]
+    assert after == original
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "changes,code",
+    [
+        ({"status_url": None, "file_url": None, "remote_file_name": None}, "recovery_job_absent"),
+        ({"status_url": None}, "recovery_job_corrupt"),
+        ({"remote_file_name": "../unsafe.zip"}, "recovery_job_unsafe"),
+        ({"status_url": "https://evil.example/status"}, "recovery_job_unsafe"),
+        ({"expected_rows": 500001}, "recovery_source_ineligible"),
+        ({"source": "other"}, "recovery_source_ineligible"),
+        ({"fiscal_year": 2024}, "recovery_source_ineligible"),
+        ({"period_start": date(2024, 10, 2)}, "recovery_source_ineligible"),
+        ({"period_end": date(2024, 10, 30)}, "recovery_source_ineligible"),
+        ({"status": "submission_unknown", "completed_at": None}, "recovery_source_ineligible"),
+        ({"last_error_code": "http_500"}, "recovery_source_ineligible"),
+    ],
+)
+def test_claim_rejects_ineligible_source_without_creating_recovery(
+    disposable_postgres_engine: Any,
+    changes: dict[str, Any],
+    code: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source = _seed_claim_source(engine, **changes)
+    with pytest.raises(TransactionWorkflowError, match=f"^{code}$"):
+        _claim(engine, source["id"])
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(attempts)) == 1
+
+
+@pytest.mark.integration
+def test_claim_rejects_unknown_and_recovery_source_ids(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    with pytest.raises(TransactionWorkflowError, match="^recovery_source_ineligible$"):
+        _claim(engine, uuid4())
+    parent = claim_source_values()
+    child = claim_source_values(recovery_of_attempt_id=parent["id"])
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), parent)
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), child)
+    with pytest.raises(TransactionWorkflowError, match="^recovery_source_ineligible$"):
+        _claim(engine, child["id"])
+
+
+@pytest.mark.parametrize(
+    "failed_id,year,start,end,code",
+    [
+        ("not-a-uuid", FISCAL_YEAR, PERIOD_START, PERIOD_END, "invalid_failed_attempt_id"),
+        (uuid4(), True, PERIOD_START, PERIOD_END, "invalid_fiscal_period"),
+        (uuid4(), FISCAL_YEAR, datetime(2024, 10, 1, tzinfo=timezone.utc), PERIOD_END, "invalid_fiscal_period"),
+        (uuid4(), FISCAL_YEAR, PERIOD_END, PERIOD_START, "invalid_fiscal_period"),
+    ],
+)
+def test_claim_rejects_invalid_inputs_before_database(
+    failed_id: Any, year: Any, start: Any, end: Any, code: str,
+) -> None:
+    fake = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    subject = claim_workflow(fake)
+    with pytest.raises(TransactionWorkflowError, match=f"^{code}$"):
+        subject.claim_failed_job_recovery(failed_id, year, start, end)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("export_rows", 1),
+        ("export_columns", 16),
+        ("archive_sha256", "a" * 64),
+        ("archive_bytes", 1),
+        ("loaded_rows", 1),
+        ("signed_obligation_total", Decimal("1.00")),
+    ],
+)
+def test_claim_rejects_each_persistable_dirty_source_field(
+    disposable_postgres_engine: Any, field: str, value: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    source = _seed_claim_source(engine, **{field: value})
+    with pytest.raises(TransactionWorkflowError, match="^recovery_source_dirty$"):
+        _claim(engine, source["id"])
+
+
+@pytest.mark.integration
+def test_claim_rejects_source_checkpoint_field(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    checkpoint_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingIngestionCheckpoint.__table__.insert(), checkpoint_values(checkpoint_id))
+        source = claim_source_values(checkpoint_id=checkpoint_id)
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), source)
+    with pytest.raises(TransactionWorkflowError, match="^recovery_source_dirty$"):
+        _claim(engine, source["id"])
+
+
+def _claim_test_transaction(checkpoint_id: UUID, action_date: date) -> dict[str, Any]:
+    return {
+        "stable_transaction_id": str(uuid4()),
+        "ingestion_checkpoint_id": checkpoint_id,
+        "generated_award_id": "CONT_AWD_1",
+        "display_award_id": "PIID-1",
+        "award_type_code": "A",
+        "action_date": action_date,
+        "fiscal_year": 2025 if action_date.month == 10 else 2024,
+        "federal_action_obligation": Decimal("1.00"),
+        "recipient_name": "Test recipient",
+        "recipient_uei": "ABC123DEF456",
+        "awarding_agency_name": "Test agency",
+        "awarding_subagency_name": "Test subagency",
+        "transaction_description": "Test transaction",
+        "source_updated_at": NOW,
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("obstacle", ["checkpoint", "in_period_row", "active_attempt"])
+def test_claim_rejects_period_ownership_obstacles(
+    disposable_postgres_engine: Any, obstacle: str,
+) -> None:
+    engine = disposable_postgres_engine
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    source = claim_source_values()
+    with engine.begin() as connection:
+        if obstacle in {"checkpoint", "in_period_row"}:
+            checkpoint_id = uuid4()
+            checkpoint = checkpoint_values(checkpoint_id)
+            if obstacle == "in_period_row":
+                checkpoint.update(period_start=date(2024, 9, 1), period_end=date(2024, 9, 30), fiscal_year=2024)
+            connection.execute(UsaSpendingIngestionCheckpoint.__table__.insert(), checkpoint)
+            if obstacle == "in_period_row":
+                connection.execute(UsaSpendingTransaction.__table__.insert(), _claim_test_transaction(checkpoint_id, PERIOD_START))
+        connection.execute(attempts.insert(), source)
+        if obstacle == "active_attempt":
+            connection.execute(attempts.insert(), attempt_values("created"))
+    with pytest.raises(TransactionWorkflowError, match="^(recovery_period_not_empty|recovery_period_conflict)$"):
+        _claim(engine, source["id"])
+
+
+@pytest.mark.integration
+def test_out_of_period_transaction_does_not_block_claim(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    checkpoint_id = uuid4()
+    checkpoint = checkpoint_values(checkpoint_id)
+    checkpoint.update(period_start=date(2024, 9, 1), period_end=date(2024, 9, 30), fiscal_year=2024)
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingIngestionCheckpoint.__table__.insert(), checkpoint)
+        connection.execute(UsaSpendingTransaction.__table__.insert(), _claim_test_transaction(checkpoint_id, date(2024, 9, 15)))
+        source = claim_source_values()
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), source)
+    assert _claim(engine, source["id"]).created is True
+
+
+def _linked_claim_values(source: dict[str, Any], status: str, **changes: Any) -> dict[str, Any]:
+    values = {
+        "id": uuid4(), "source": source["source"], "fiscal_year": source["fiscal_year"],
+        "period_start": source["period_start"], "period_end": source["period_end"],
+        "status": status, "expected_rows": source["expected_rows"],
+        "status_url": source["status_url"], "file_url": source["file_url"],
+        "remote_file_name": source["remote_file_name"],
+        "parent_attempt_id": source.get("parent_attempt_id"),
+        "recovery_of_attempt_id": source["id"], "failure_count": 0,
+        "started_at": NOW, "created_at": NOW, "updated_at": NOW,
+    }
+    if status in {"export_finished", "archive_hashed", "loading", "completed"}:
+        values.update(export_rows=1, export_columns=16)
+    if status in {"archive_hashed", "loading", "completed"}:
+        values.update(archive_sha256="a" * 64, archive_bytes=123)
+    if status == "completed":
+        values.update(loaded_rows=1, signed_obligation_total=Decimal("1.00"),
+                      completed_at=NOW)
+    if status == "failed":
+        values.update(last_error_code="http_500", completed_at=NOW)
+    values.update(changes)
+    return values
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("status", ["submitted", "export_finished", "archive_hashed", "loading"])
+def test_valid_nonterminal_linked_recovery_is_reused(
+    disposable_postgres_engine: Any, status: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source = claim_source_values()
+    linked = _linked_claim_values(source, status)
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), source)
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), linked)
+    claim = _claim(engine, source["id"])
+    assert claim.recovery_attempt_id == linked["id"]
+    assert claim.created is False
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("obstacle", ["checkpoint", "in_period_row"])
+def test_nonterminal_linked_recovery_still_requires_empty_period(
+    disposable_postgres_engine: Any, obstacle: str,
+) -> None:
+    engine = disposable_postgres_engine
+    source = claim_source_values()
+    linked = _linked_claim_values(source, "submitted")
+    checkpoint_id = uuid4()
+    checkpoint = checkpoint_values(checkpoint_id)
+    if obstacle == "in_period_row":
+        checkpoint.update(period_start=date(2024, 9, 1), period_end=date(2024, 9, 30), fiscal_year=2024)
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingIngestionCheckpoint.__table__.insert(), checkpoint)
+        if obstacle == "in_period_row":
+            connection.execute(UsaSpendingTransaction.__table__.insert(), _claim_test_transaction(checkpoint_id, PERIOD_START))
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), source)
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), linked)
+    with pytest.raises(TransactionWorkflowError, match="^recovery_period_not_empty$"):
+        _claim(engine, source["id"])
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "status,changes",
+    [
+        ("submitted", {"expected_rows": 8}),
+        ("submitted", {"parent_attempt_id": uuid4()}),
+        ("submitted", {"status_url": "https://api.usaspending.gov/other"}),
+        ("submitted", {"export_rows": 1}),
+        ("export_finished", {"archive_bytes": 10}),
+        ("archive_hashed", {"loaded_rows": 1}),
+        ("loading", {"completed_at": None, "checkpoint_id": uuid4()}),
+        ("counted", {}),
+        ("failed", {}),
+    ],
+)
+def test_inconsistent_or_illegal_linked_recovery_blocks_another(
+    disposable_postgres_engine: Any, status: str, changes: dict[str, Any],
+) -> None:
+    engine = disposable_postgres_engine
+    source = claim_source_values()
+    linked = _linked_claim_values(source, status, **changes)
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.insert(), source)
+        if linked["parent_attempt_id"] is not None:
+            parent = attempt_values("failed", attempt_id=linked["parent_attempt_id"])
+            parent.update(period_start=date(2024, 9, 1), period_end=date(2024, 9, 30), fiscal_year=2024)
+            connection.execute(attempts.insert(), parent)
+        if linked.get("checkpoint_id") is not None:
+            connection.execute(UsaSpendingIngestionCheckpoint.__table__.insert(), checkpoint_values(linked["checkpoint_id"]))
+        connection.execute(attempts.insert(), linked)
+    with pytest.raises(TransactionWorkflowError, match="^recovery_link_invalid$"):
+        _claim(engine, source["id"])
+    with engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(attempts).where(attempts.c.recovery_of_attempt_id == source["id"])) == 1
+
+
+@pytest.mark.integration
+def test_completed_linked_recovery_with_owned_rows_is_reused(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    source = claim_source_values()
+    checkpoint_id = uuid4()
+    linked = _linked_claim_values(source, "completed", checkpoint_id=checkpoint_id)
+    checkpoint = checkpoint_values(checkpoint_id)
+    with engine.begin() as connection:
+        connection.execute(UsaSpendingIngestionCheckpoint.__table__.insert(), checkpoint)
+        connection.execute(UsaSpendingTransaction.__table__.insert(), _claim_test_transaction(checkpoint_id, PERIOD_START))
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), source)
+        connection.execute(UsaSpendingTransactionIngestionAttempt.__table__.insert(), linked)
+    claim = _claim(engine, source["id"])
+    assert claim.recovery_attempt_id == linked["id"]
+    assert claim.created is False
+
+
+@pytest.mark.integration
+def test_two_workers_claim_one_recovery_without_mutating_source(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    source = _seed_claim_source(engine)
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.connect() as connection:
+        before = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
+    gate = threading.Barrier(2)
+
+    def worker() -> Any:
+        subject = claim_workflow(engine)
+        gate.wait(timeout=10)
+        return subject.claim_failed_job_recovery(source["id"], FISCAL_YEAR, PERIOD_START, PERIOD_END)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(worker) for _ in range(2)]
+        claims = [future.result(timeout=20) for future in futures]
+    with engine.connect() as connection:
+        after = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
+        linked = connection.execute(select(attempts.c.id).where(attempts.c.recovery_of_attempt_id == source["id"])).all()
+    assert len(linked) == 1
+    assert {claim.recovery_attempt_id for claim in claims} == {linked[0].id}
+    assert sorted(claim.created for claim in claims) == [False, True]
+    assert after == before
+
+
 @pytest.mark.integration
 def test_stop_after_count_persists_count_without_submission(
     disposable_postgres_engine: Any,
