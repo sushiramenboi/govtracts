@@ -269,6 +269,10 @@ class UsaSpendingTransactionIngestionAttempt(Base):
             name="not_self_parent",
         ),
         CheckConstraint(
+            "recovery_of_attempt_id IS NULL OR recovery_of_attempt_id != id",
+            name="not_self_recovery",
+        ),
+        CheckConstraint(
             "status != 'subdivided' OR ("
             "expected_rows > 500000 AND export_rows IS NULL "
             "AND export_columns IS NULL AND status_url IS NULL "
@@ -314,6 +318,13 @@ class UsaSpendingTransactionIngestionAttempt(Base):
                 "parent_attempt_id IS NOT NULL AND status != 'failed'"
             ),
         ),
+        Index(
+            "uq_usaspending_attempts_recovery_of",
+            "recovery_of_attempt_id",
+            unique=True,
+            postgresql_where=text("recovery_of_attempt_id IS NOT NULL"),
+            sqlite_where=text("recovery_of_attempt_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
@@ -346,6 +357,15 @@ class UsaSpendingTransactionIngestionAttempt(Base):
         ForeignKey(
             "usaspending_transaction_ingestion_attempts.id",
             name="fk_usaspending_attempt_parent",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    recovery_of_attempt_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey(
+            "usaspending_transaction_ingestion_attempts.id",
+            name="fk_usaspending_attempt_recovery_of",
             ondelete="RESTRICT",
         ),
         nullable=True,

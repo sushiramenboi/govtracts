@@ -17,7 +17,7 @@ def test_export_bound_count_migration_is_the_only_head_revision() -> None:
     config = Config(str(API_ROOT / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20261004_0006"]
+    assert script.get_heads() == ["20261017_0007"]
 
 
 @pytest.mark.integration

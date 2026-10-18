@@ -39,6 +39,12 @@ SUBDIVISION_MIGRATION_PATH = (
     / "versions"
     / "20261004_0006_usaspending_backfill_subdivisions.py"
 )
+RECOVERY_MIGRATION_PATH = (
+    API_ROOT
+    / "alembic"
+    / "versions"
+    / "20261017_0007_usaspending_same_job_recovery.py"
+)
 MIGRATION_0005_TERMINAL_CHECK = (
     "((status IN ('completed', 'failed')) = (completed_at IS NOT NULL)) AND "
     "(status != 'completed' OR "
@@ -289,6 +295,118 @@ def test_subdivision_migration_downgrade_guard_precedes_mutation(
     migration.downgrade()
 
     assert events[0] == "guard"
+
+
+def test_recovery_migration_matches_model_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration(RECOVERY_MIGRATION_PATH, "recovery_0007")
+    operations = Mock()
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.upgrade()
+
+    table = UsaSpendingTransactionIngestionAttempt.__table__
+    column = operations.add_column.call_args.args[1]
+    assert migration.revision == "20261017_0007"
+    assert migration.down_revision == "20261004_0006"
+    assert column.name == "recovery_of_attempt_id"
+    assert column.nullable == table.c.recovery_of_attempt_id.nullable
+    assert str(column.type) == str(table.c.recovery_of_attempt_id.type)
+    assert operations.create_foreign_key.call_args.args == (
+        "fk_usaspending_attempt_recovery_of",
+        table.name,
+        table.name,
+        ["recovery_of_attempt_id"],
+        ["id"],
+    )
+    assert operations.create_foreign_key.call_args.kwargs == {
+        "ondelete": "RESTRICT"
+    }
+    checks = _check_definitions(list(table.constraints))
+    assert operations.create_check_constraint.call_args.args == (
+        "ck_usaspending_transaction_ingestion_attempts_not_self_recovery",
+        table.name,
+        checks["ck_usaspending_transaction_ingestion_attempts_not_self_recovery"],
+    )
+    index = next(
+        index
+        for index in table.indexes
+        if index.name == "uq_usaspending_attempts_recovery_of"
+    )
+    assert operations.create_index.call_args.args == (
+        index.name,
+        table.name,
+        ["recovery_of_attempt_id"],
+    )
+    assert operations.create_index.call_args.kwargs["unique"] is True
+    assert _normalize_sql(
+        operations.create_index.call_args.kwargs["postgresql_where"]
+    ) == _normalize_sql(index.dialect_options["postgresql"]["where"])
+    assert [call[0] for call in operations.mock_calls] == [
+        "add_column",
+        "create_foreign_key",
+        "create_check_constraint",
+        "create_index",
+    ]
+    assert all(
+        len(name.encode("utf-8")) <= 63
+        for name in (
+            "fk_usaspending_attempt_recovery_of",
+            "ck_usaspending_transaction_ingestion_attempts_not_self_recovery",
+            "uq_usaspending_attempts_recovery_of",
+        )
+    )
+
+
+def test_recovery_migration_downgrade_guard_precedes_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration(RECOVERY_MIGRATION_PATH, "recovery_0007_guard")
+    operations = Mock()
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.downgrade()
+
+    assert operations.mock_calls[0][0] == "execute"
+    guard_sql = str(operations.execute.call_args.args[0])
+    assert "recovery_of_attempt_id IS NOT NULL" in guard_sql
+    assert "used USAspending recovery lineage cannot be downgraded safely" in guard_sql
+    assert [call[0] for call in operations.mock_calls[1:]] == [
+        "drop_index",
+        "drop_constraint",
+        "drop_constraint",
+        "drop_column",
+    ]
+
+
+def test_recovery_migration_compiles_for_postgresql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration(RECOVERY_MIGRATION_PATH, "recovery_0007_ddl")
+    output = io.StringIO()
+    operations = Operations(
+        MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+    )
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.upgrade()
+    migration.downgrade()
+
+    ddl = output.getvalue()
+    assert "ADD COLUMN recovery_of_attempt_id UUID" in ddl
+    assert "ON DELETE RESTRICT" in ddl
+    assert "recovery_of_attempt_id IS NOT NULL" in ddl
+    assert "used USAspending recovery lineage cannot be downgraded safely" in ddl
+    assert all(
+        len(identifier.encode("utf-8")) <= 63
+        for identifier in re.findall(
+            r'\b(?:CONSTRAINT|INDEX)\s+"?([a-z0-9_]+)"?', ddl,
+        )
+    )
 
 
 def test_migration_compiles_for_postgresql_with_bounded_identifiers(
@@ -734,16 +852,42 @@ def test_0006_check_assertions_reject_semantic_changes(
 
 def _assert_live_0006_schema(connection: sa.Connection) -> None:
     table_name = "usaspending_transaction_ingestion_attempts"
-    model_table = UsaSpendingTransactionIngestionAttempt.__table__
     inspector = inspect(connection)
+    expected_nullable = {
+        "id": False,
+        "source": False,
+        "fiscal_year": False,
+        "period_start": False,
+        "period_end": False,
+        "status": False,
+        "expected_rows": True,
+        "status_url": True,
+        "file_url": True,
+        "remote_file_name": True,
+        "archive_sha256": True,
+        "archive_bytes": True,
+        "loaded_rows": True,
+        "signed_obligation_total": True,
+        "checkpoint_id": True,
+        "last_error_code": True,
+        "last_error_detail": True,
+        "failure_count": False,
+        "started_at": False,
+        "completed_at": True,
+        "created_at": False,
+        "updated_at": False,
+        "export_rows": True,
+        "export_columns": True,
+        "parent_attempt_id": True,
+    }
 
     columns = {
         column["name"]: column
         for column in inspector.get_columns(table_name)
     }
-    assert set(columns) == set(model_table.c.keys())
-    for name, model_column in model_table.c.items():
-        assert columns[name]["nullable"] is model_column.nullable
+    assert set(columns) == set(expected_nullable)
+    for name, nullable in expected_nullable.items():
+        assert columns[name]["nullable"] is nullable
 
     foreign_keys = {
         foreign_key["name"]: foreign_key
@@ -1112,6 +1256,164 @@ def test_live_postgresql_0006_enforces_self_parent_and_parent_delete_restriction
                     connection.execute(
                         attempts.delete().where(attempts.c.id == parent_id)
                     )
+    finally:
+        _drop_live_schema(engine, schema)
+
+
+@pytest.mark.integration
+def test_live_postgresql_0007_preserves_and_enforces_recovery_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, schema, _ = _prepare_live_migration_0006(monkeypatch)
+    migration = _load_migration(
+        RECOVERY_MIGRATION_PATH,
+        f"attempts_0007_{schema}",
+    )
+    now = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    source_id = uuid4()
+    recovery_id = uuid4()
+    base = {
+        "source": "usaspending",
+        "fiscal_year": 2025,
+        "failure_count": 0,
+        "started_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+            attempts_0006 = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            connection.execute(
+                attempts_0006.insert(),
+                {
+                    "id": source_id,
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 16),
+                    "status": "failed",
+                    "last_error_code": "http_404",
+                    "completed_at": now,
+                },
+            )
+            original = _read_normalized_attempt_rows(connection, attempts_0006)
+            monkeypatch.setattr(
+                migration,
+                "op",
+                Operations(MigrationContext.configure(connection)),
+            )
+            migration.upgrade()
+            attempts_0007 = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            assert _read_normalized_attempt_rows(connection, attempts_0007) == {
+                key: {**row, "recovery_of_attempt_id": None}
+                for key, row in original.items()
+            }
+
+            migration.downgrade()
+            assert "recovery_of_attempt_id" not in {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "usaspending_transaction_ingestion_attempts"
+                )
+            }
+            migration.upgrade()
+            attempts = sa.Table(
+                "usaspending_transaction_ingestion_attempts",
+                sa.MetaData(),
+                autoload_with=connection,
+            )
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": recovery_id,
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 16),
+                    "status": "submitted",
+                    "expected_rows": 1,
+                    "status_url": "https://example.invalid/status/recovery",
+                    "file_url": "https://example.invalid/file/recovery",
+                    "remote_file_name": "recovery.zip",
+                    "recovery_of_attempt_id": source_id,
+                },
+            )
+            assert connection.scalar(
+                sa.select(attempts.c.recovery_of_attempt_id).where(
+                    attempts.c.id == recovery_id
+                )
+            ) == source_id
+
+            invalid_cases = (
+                (uuid4(), source_id),
+                (uuid4(), uuid4()),
+            )
+            for candidate_id, target_id in invalid_cases:
+                with pytest.raises(IntegrityError):
+                    with connection.begin_nested():
+                        connection.execute(
+                            attempts.insert(),
+                            {
+                                "id": candidate_id,
+                                **base,
+                                "period_start": date(2024, 11, 1),
+                                "period_end": date(2024, 11, 30),
+                                "status": "failed",
+                                "last_error_code": "test_failure",
+                                "completed_at": now,
+                                "recovery_of_attempt_id": target_id,
+                            },
+                        )
+
+            self_id = uuid4()
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        attempts.insert(),
+                        {
+                            "id": self_id,
+                            **base,
+                            "period_start": date(2024, 12, 1),
+                            "period_end": date(2024, 12, 31),
+                            "status": "failed",
+                            "last_error_code": "test_failure",
+                            "completed_at": now,
+                            "recovery_of_attempt_id": self_id,
+                        },
+                    )
+
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        attempts.delete().where(attempts.c.id == source_id)
+                    )
+            assert connection.scalar(sa.select(sa.func.count()).select_from(attempts)) == 2
+
+        with pytest.raises(DBAPIError, match="used USAspending recovery lineage"):
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+                monkeypatch.setattr(
+                    migration,
+                    "op",
+                    Operations(MigrationContext.configure(connection)),
+                )
+                migration.downgrade()
+
+        with engine.connect() as connection:
+            connection.exec_driver_sql(f'SET search_path TO "{schema}"')
+            assert "recovery_of_attempt_id" in {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "usaspending_transaction_ingestion_attempts"
+                )
+            }
     finally:
         _drop_live_schema(engine, schema)
 
