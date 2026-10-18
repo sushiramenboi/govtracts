@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, BinaryIO
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
@@ -193,6 +193,69 @@ class UsaSpendingClient:
             file_url=file_url,
             file_name=file_name,
         )
+
+    def validate_persisted_bulk_export_job(self, job: BulkExportJob) -> BulkExportJob:
+        """Validate a stored job identity without making a request."""
+        if not isinstance(job, BulkExportJob):
+            raise UsaSpendingError("invalid_persisted_bulk_export_job")
+        if not isinstance(job.status_url, str) or not job.status_url or "\x00" in job.status_url:
+            raise UsaSpendingError("unsafe_status_url")
+        if not isinstance(job.file_url, str) or not job.file_url or "\x00" in job.file_url:
+            raise UsaSpendingError("unsafe_file_url")
+        self._validate_remote_url(job.status_url, {API_HOST}, "status")
+        self._validate_remote_url(job.file_url, {FILE_HOST}, "file")
+
+        file_name = job.file_name
+        if (
+            not isinstance(file_name, str)
+            or not file_name
+            or len(file_name) > 512
+            or not file_name.endswith(".zip")
+        ):
+            raise UsaSpendingError("invalid_persisted_bulk_export_filename")
+        decoded_name = file_name
+        try:
+            for _ in range(len(file_name)):
+                next_name = unquote(decoded_name, encoding="utf-8", errors="strict")
+                if next_name == decoded_name:
+                    break
+                decoded_name = next_name
+        except UnicodeDecodeError:
+            raise UsaSpendingError("invalid_persisted_bulk_export_filename") from None
+        if (
+            decoded_name.startswith(".")
+            or "\x00" in decoded_name
+            or "/" in decoded_name
+            or "\\" in decoded_name
+        ):
+            raise UsaSpendingError("invalid_persisted_bulk_export_filename")
+
+        try:
+            file_basename = unquote(
+                urlparse(job.file_url).path.rsplit("/", 1)[-1],
+                encoding="utf-8",
+                errors="strict",
+            )
+            status_file_names = parse_qs(
+                urlparse(job.status_url).query,
+                keep_blank_values=True,
+                encoding="utf-8",
+                errors="strict",
+            ).get("file_name", [])
+        except UnicodeDecodeError:
+            raise UsaSpendingError("persisted_bulk_export_identity_mismatch") from None
+        if (
+            file_basename != file_name
+            or "/" in file_basename
+            or "\\" in file_basename
+            or "\x00" in file_basename
+            or (
+                status_file_names
+                and (len(status_file_names) != 1 or status_file_names[0] != file_name)
+            )
+        ):
+            raise UsaSpendingError("persisted_bulk_export_identity_mismatch")
+        return job
 
     async def poll_bulk_export(
         self,

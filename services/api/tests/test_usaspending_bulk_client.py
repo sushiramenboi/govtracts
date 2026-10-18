@@ -229,6 +229,153 @@ def test_bulk_submission_uses_only_approved_fields_and_captures_job(
     }
 
 
+def _offline_persisted_job_client(monkeypatch: pytest.MonkeyPatch) -> UsaSpendingClient:
+    client = UsaSpendingClient(settings())
+
+    def reject_network(*_: object, **__: object) -> None:
+        pytest.fail("persisted-job validation attempted a network operation")
+
+    for name in ("_request_json", "_async_request_json", "_http_client", "_async_http_client"):
+        monkeypatch.setattr(client, name, reject_network)
+    return client
+
+
+@pytest.mark.parametrize(
+    "status_url,file_url",
+    [
+        (
+            "https://api.usaspending.gov/api/v2/download/status",
+            "https://files.usaspending.gov/generated_downloads/x.zip",
+        ),
+        (
+            "https://api.usaspending.gov/api/v2/download/status?file_name=x.zip",
+            "https://files.usaspending.gov/generated_downloads/x%2Ezip",
+        ),
+        (
+            "https://api.usaspending.gov/other/status?file_name=x%2Ezip",
+            "https://files.usaspending.gov/other/x.zip",
+        ),
+    ],
+)
+def test_validate_persisted_bulk_export_job_accepts_safe_identity_offline(
+    monkeypatch: pytest.MonkeyPatch, status_url: str, file_url: str
+) -> None:
+    client = _offline_persisted_job_client(monkeypatch)
+    persisted = BulkExportJob(status_url=status_url, file_url=file_url, file_name="x.zip")
+
+    assert client.validate_persisted_bulk_export_job(persisted) is persisted
+
+
+def test_validate_persisted_bulk_export_job_allows_512_character_filename_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _offline_persisted_job_client(monkeypatch)
+    file_name = "a" * 508 + ".zip"
+    persisted = BulkExportJob(
+        status_url="https://api.usaspending.gov/status",
+        file_url=f"https://files.usaspending.gov/generated_downloads/{file_name}",
+        file_name=file_name,
+    )
+
+    assert len(file_name) == 512
+    assert client.validate_persisted_bulk_export_job(persisted) is persisted
+
+
+@pytest.mark.parametrize(
+    "field,url,category",
+    [
+        ("status_url", "http://api.usaspending.gov/status", "unsafe_status_url"),
+        ("status_url", "https://evil.example/status", "unsafe_status_url"),
+        ("status_url", "https://user:password@api.usaspending.gov/status", "unsafe_status_url"),
+        ("status_url", "https://api.usaspending.gov:444/status", "unsafe_status_url"),
+        ("file_url", "http://files.usaspending.gov/x.zip", "unsafe_file_url"),
+        ("file_url", "https://evil.example/x.zip", "unsafe_file_url"),
+        ("file_url", "https://user:password@files.usaspending.gov/x.zip", "unsafe_file_url"),
+        ("file_url", "https://files.usaspending.gov:444/x.zip", "unsafe_file_url"),
+    ],
+)
+def test_validate_persisted_bulk_export_job_rejects_unsafe_urls_offline(
+    monkeypatch: pytest.MonkeyPatch, field: str, url: str, category: str
+) -> None:
+    client = _offline_persisted_job_client(monkeypatch)
+    values = {
+        "status_url": job().status_url,
+        "file_url": job().file_url,
+        "file_name": "x.zip",
+    }
+    values[field] = url
+
+    with pytest.raises(UsaSpendingError, match=f"^{category}$"):
+        client.validate_persisted_bulk_export_job(BulkExportJob(**values))
+
+
+@pytest.mark.parametrize(
+    "file_name",
+    [
+        "",
+        "a" * 509 + ".zip",
+        "x.csv",
+        "a/b.zip",
+        "a\\b.zip",
+        "x\x00.zip",
+        ".zip",
+        "../x.zip",
+        "x%2F.zip",
+        "x%5C.zip",
+        "x%252F.zip",
+        "x%255C.zip",
+        "x%00.zip",
+    ],
+)
+def test_validate_persisted_bulk_export_job_rejects_unsafe_filenames_offline(
+    monkeypatch: pytest.MonkeyPatch, file_name: str
+) -> None:
+    client = _offline_persisted_job_client(monkeypatch)
+
+    with pytest.raises(UsaSpendingError, match="^invalid_persisted_bulk_export_filename$"):
+        client.validate_persisted_bulk_export_job(
+            BulkExportJob(job().status_url, job().file_url, file_name)
+        )
+
+
+@pytest.mark.parametrize(
+    "file_url",
+    [
+        "https://files.usaspending.gov/generated_downloads/other.zip",
+        "https://files.usaspending.gov/generated_downloads/x%2F.zip",
+        "https://files.usaspending.gov/generated_downloads/x%5C.zip",
+    ],
+)
+def test_validate_persisted_bulk_export_job_rejects_file_basename_mismatch_offline(
+    monkeypatch: pytest.MonkeyPatch, file_url: str
+) -> None:
+    client = _offline_persisted_job_client(monkeypatch)
+
+    with pytest.raises(UsaSpendingError, match="^persisted_bulk_export_identity_mismatch$"):
+        client.validate_persisted_bulk_export_job(
+            BulkExportJob(job().status_url, file_url, "x.zip")
+        )
+
+
+@pytest.mark.parametrize(
+    "status_url",
+    [
+        "https://api.usaspending.gov/status?file_name=other.zip",
+        "https://api.usaspending.gov/status?file_name=x.zip&file_name=x.zip",
+        "https://api.usaspending.gov/status?file_name=x.zip&file_name=other.zip",
+    ],
+)
+def test_validate_persisted_bulk_export_job_rejects_status_filename_conflicts_offline(
+    monkeypatch: pytest.MonkeyPatch, status_url: str
+) -> None:
+    client = _offline_persisted_job_client(monkeypatch)
+
+    with pytest.raises(UsaSpendingError, match="^persisted_bulk_export_identity_mismatch$"):
+        client.validate_persisted_bulk_export_job(
+            BulkExportJob(status_url, job().file_url, "x.zip")
+        )
+
+
 def test_sync_request_creation_error_is_translated(monkeypatch: pytest.MonkeyPatch) -> None:
     client = UsaSpendingClient(settings())
 
