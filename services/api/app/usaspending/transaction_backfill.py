@@ -560,12 +560,15 @@ class BackfillCoordinator:
         limits: BackfillLimits,
         backup_identifier: str,
         retry_failed_attempt_id: UUID | None = None,
+        recover_failed_job_attempt_id: UUID | None = None,
         require_pilot: bool = True,
     ) -> BackfillResult:
         self._validate_invocation(
             roots,
+            limits=limits,
             backup_identifier=backup_identifier,
             retry_failed_attempt_id=retry_failed_attempt_id,
+            recover_failed_job_attempt_id=recover_failed_job_attempt_id,
         )
         runner_id = uuid4()
         if require_pilot:
@@ -581,6 +584,7 @@ class BackfillCoordinator:
                 root,
                 limits=limits,
                 retry_failed_attempt_id=retry_failed_attempt_id,
+                recover_failed_job_attempt_id=recover_failed_job_attempt_id,
             )
             if not completed:
                 status = "bounded"
@@ -600,14 +604,23 @@ class BackfillCoordinator:
         self,
         roots: Sequence[FiscalPeriod],
         *,
+        limits: BackfillLimits,
         backup_identifier: str,
         retry_failed_attempt_id: UUID | None,
+        recover_failed_job_attempt_id: UUID | None,
     ) -> None:
         canonicalize_backup_identifier(backup_identifier)
         if retry_failed_attempt_id is not None and not isinstance(
             retry_failed_attempt_id, UUID
         ):
             raise BackfillError("invalid_retry_authorization")
+        if recover_failed_job_attempt_id is not None:
+            if not isinstance(recover_failed_job_attempt_id, UUID):
+                raise BackfillError("invalid_recovery_authorization")
+            if retry_failed_attempt_id is not None:
+                raise BackfillError("conflicting_retry_authorizations")
+            if len(roots) != 1 or limits.max_periods != 1:
+                raise BackfillError("recovery_requires_one_period")
         if not roots:
             raise BackfillError("empty_backfill_selection")
         periods: list[tuple[date, date]] = []
@@ -632,10 +645,17 @@ class BackfillCoordinator:
         *,
         limits: BackfillLimits,
         retry_failed_attempt_id: UUID | None,
+        recover_failed_job_attempt_id: UUID | None = None,
     ) -> bool:
         if limits.max_periods is not None and self._processed >= limits.max_periods:
             return False
         self._processed += 1
+        if recover_failed_job_attempt_id is not None:
+            return await self._run_same_job_recovery(
+                period,
+                failed_attempt_id=recover_failed_job_attempt_id,
+                limits=limits,
+            )
         attempt = self._period_attempt(period)
         if attempt is None:
             month_bounds = fiscal_month_bounds(
@@ -645,6 +665,18 @@ class BackfillCoordinator:
             )
             if (period.start, period.end) != month_bounds:
                 raise BackfillError("selected_leaf_missing")
+        if attempt is not None and attempt.get("recovery_of_attempt_id") is not None:
+            if attempt["status"] != "completed":
+                raise BackfillError("same_job_recovery_required")
+        if attempt is not None and attempt["status"] == "failed":
+            job_identity = tuple(
+                attempt.get(name)
+                for name in ("status_url", "file_url", "remote_file_name")
+            )
+            if any(value is not None for value in job_identity):
+                if not all(value is not None for value in job_identity):
+                    raise BackfillError("failed_job_identity_partial")
+                raise BackfillError("same_job_recovery_required")
         self._assert_no_overlapping_state(period, exact_attempt=attempt)
         if attempt is not None and attempt["status"] == "completed":
             self._verifier.verify(attempt["id"], expected_period=period)
@@ -781,6 +813,84 @@ class BackfillCoordinator:
             counts_as_submission=True,
         )
 
+    async def _run_same_job_recovery(
+        self,
+        period: FiscalPeriod,
+        *,
+        failed_attempt_id: UUID,
+        limits: BackfillLimits,
+    ) -> bool:
+        claim = self._workflow.claim_failed_job_recovery(
+            failed_attempt_id,
+            period.fiscal_year,
+            period.start,
+            period.end,
+        )
+        recovery_id = claim.recovery_attempt_id
+        if claim.failed_attempt_id != failed_attempt_id or not isinstance(
+            recovery_id, UUID
+        ) or claim.attempt.get("id") != recovery_id:
+            raise BackfillError("recovery_claim_mismatch")
+        self._record(
+            "same_job_recovery_claimed" if claim.created else "same_job_recovery_resumed",
+            period,
+            attempt_id=recovery_id,
+            recovery_of_attempt_id=failed_attempt_id,
+        )
+        self._assert_no_overlapping_state(period, exact_attempt=claim.attempt)
+        persisted_rows = claim.attempt.get("export_rows")
+        initial_rows = (
+            persisted_rows
+            if isinstance(persisted_rows, int) and not isinstance(persisted_rows, bool)
+            else DEFAULT_MAX_ROWS
+        )
+        if not self._reserve_storage(recovery_id, period, initial_rows, limits=limits):
+            return False
+
+        def capacity_guard(export_rows: int) -> None:
+            if not self._reserve_storage(
+                recovery_id, period, export_rows, limits=limits
+            ):
+                raise _ExecutionBoundReached
+
+        try:
+            result = await self._workflow.resume_failed_job_recovery(
+                recovery_attempt_id=recovery_id,
+                expected_failed_attempt_id=failed_attempt_id,
+                fiscal_year=period.fiscal_year,
+                period_start=period.start,
+                period_end=period.end,
+                capacity_guard=capacity_guard,
+            )
+        except _ExecutionBoundReached:
+            return False
+        if result.attempt_id != recovery_id:
+            raise BackfillError("recovery_attempt_mismatch")
+        if result.status != "completed":
+            if result.status == "failed":
+                raise BackfillError("period_failed")
+            raise BackfillError("leaf_incomplete")
+        if (
+            not isinstance(result.export_rows, int)
+            or isinstance(result.export_rows, bool)
+            or not 0 <= result.export_rows <= DEFAULT_MAX_ROWS
+        ):
+            raise BackfillError("invalid_persisted_export_rows")
+        verified = self._verifier.verify(recovery_id, expected_period=period)
+        self._complete_storage(recovery_id)
+        self._record(
+            "leaf_completed",
+            period,
+            attempt_id=recovery_id,
+            recovery_of_attempt_id=failed_attempt_id,
+            checkpoint_id=verified.checkpoint_id,
+            expected_rows=result.export_rows,
+            loaded_rows=verified.rows,
+            signed_obligation_total=str(verified.signed_obligation_total),
+            estimated_new_bytes=self._estimated_by_attempt[recovery_id],
+        )
+        return True
+
     async def _run_leaf(
         self,
         period: FiscalPeriod,
@@ -908,6 +1018,13 @@ class BackfillCoordinator:
                     self._attempts.c.id.desc(),
                 )
             ).mappings().all()
+        linked_recoveries = [
+            row for row in rows if row["recovery_of_attempt_id"] is not None
+        ]
+        if len(linked_recoveries) > 1:
+            raise BackfillError("unexpected_overlapping_state")
+        if linked_recoveries:
+            return dict(linked_recoveries[0])
         return dict(rows[0]) if rows else None
 
     def _assert_no_overlapping_state(
@@ -1491,7 +1608,7 @@ def sanitize_progress_record(record: Mapping[str, object]) -> dict[str, object]:
         "local_free_bytes",
         "local_required_bytes",
     }
-    optional_uuids = {"attempt_id", "checkpoint_id"}
+    optional_uuids = {"attempt_id", "checkpoint_id", "recovery_of_attempt_id"}
     allowed = required | optional_ints | optional_uuids | {
         "signed_obligation_total"
     }

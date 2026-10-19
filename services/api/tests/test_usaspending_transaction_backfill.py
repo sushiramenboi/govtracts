@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import io
@@ -193,6 +194,8 @@ class FakeVerifier:
 class FakeStorageGuard:
     def __init__(self) -> None:
         self.counts: list[int] = []
+        self.keys: list[object | None] = []
+        self.completed: list[object] = []
 
     def check(
         self,
@@ -200,12 +203,64 @@ class FakeStorageGuard:
         *,
         reservation_key: object | None = None,
     ) -> StorageDecision:
-        del reservation_key
         self.counts.append(expected_rows)
+        self.keys.append(reservation_key)
         return StorageDecision(expected_rows * 1000, 1, 10**12, 10**12)
 
     def complete(self, reservation_key: object) -> None:
-        del reservation_key
+        self.completed.append(reservation_key)
+
+
+class RecoveryWorkflowDouble:
+    def __init__(
+        self,
+        failed_id: UUID,
+        recovery_id: UUID,
+        *,
+        export_rows: int | None = None,
+        created: bool = True,
+        result_status: str = "completed",
+        capacity_rows: int | None = None,
+    ) -> None:
+        self.failed_id = failed_id
+        self.recovery_id = recovery_id
+        self.export_rows = export_rows
+        self.created = created
+        self.result_status = result_status
+        self.capacity_rows = capacity_rows
+        self.claim_calls: list[tuple[object, ...]] = []
+        self.resume_calls: list[dict[str, Any]] = []
+
+    def claim_failed_job_recovery(
+        self, attempt_id: UUID, fiscal_year: int, start: date, end: date
+    ) -> Any:
+        self.claim_calls.append((attempt_id, fiscal_year, start, end))
+        return SimpleNamespace(
+            failed_attempt_id=self.failed_id,
+            recovery_attempt_id=self.recovery_id,
+            created=self.created,
+            attempt={
+                "id": self.recovery_id,
+                "export_rows": self.export_rows,
+                "status_url": "https://secret.invalid/status",
+                "file_url": "https://secret.invalid/archive.zip",
+                "remote_file_name": "secret.zip",
+                "last_error_detail": "secret error detail",
+            },
+        )
+
+    async def resume_failed_job_recovery(self, **kwargs: Any) -> Any:
+        self.resume_calls.append(kwargs)
+        if self.capacity_rows is not None:
+            kwargs["capacity_guard"](self.capacity_rows)
+        return workflow_result(
+            attempt_id=self.recovery_id,
+            status=self.result_status,
+            count=self.export_rows if self.export_rows is not None else 1,
+        )
+
+    async def run_period(self, **_kwargs: Any) -> Any:
+        pytest.fail("ordinary export workflow must not run during recovery")
 
 
 class MemoryCoordinator(BackfillCoordinator):
@@ -514,6 +569,281 @@ def test_authorized_failed_attempt_creates_and_completes_a_new_attempt() -> None
         and record["attempt_id"] == str(failed_id)
         for record in result.records
     )
+
+
+def test_same_job_recovery_selects_exact_job_without_submission() -> None:
+    period = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 15))
+    failed_id = uuid4()
+    recovery_id = uuid4()
+    calls: list[tuple[object, ...]] = []
+
+    class RecoveryWorkflow:
+        def claim_failed_job_recovery(
+            self, attempt_id: UUID, fiscal_year: int, start: date, end: date
+        ) -> Any:
+            calls.append(("claim", attempt_id, fiscal_year, start, end))
+            return SimpleNamespace(
+                recovery_attempt_id=recovery_id,
+                failed_attempt_id=failed_id,
+                attempt={"id": recovery_id, "export_rows": 1},
+                created=True,
+            )
+
+        async def resume_failed_job_recovery(self, **kwargs: Any) -> Any:
+            calls.append(("resume", kwargs["recovery_attempt_id"]))
+            kwargs["capacity_guard"](1)
+            return workflow_result(attempt_id=recovery_id, status="completed", count=1)
+
+        async def run_period(self, **_kwargs: Any) -> Any:
+            pytest.fail("ordinary export workflow must not run during recovery")
+
+    subject = MemoryCoordinator(
+        RecoveryWorkflow(),  # type: ignore[arg-type]
+        FakeVerifier(),
+        FakeStorageGuard(),
+    )
+    result = run(
+        subject.run(
+            [period],
+            limits=BackfillLimits(max_periods=1, max_leaf_submissions=1),
+            backup_identifier=VALID_BACKUP_IDENTIFIER,
+            recover_failed_job_attempt_id=failed_id,
+            require_pilot=False,
+        )
+    )
+
+    assert result.status == "completed"
+    assert (result.processed_periods, result.submitted_leaves) == (1, 0)
+    assert calls == [
+        ("claim", failed_id, period.fiscal_year, period.start, period.end),
+        ("resume", recovery_id),
+    ]
+    assert [record["event"] for record in result.records if record["event"].startswith("same_job")] == [
+        "same_job_recovery_claimed"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("created", "export_rows", "expected_rows"),
+    [(True, None, DEFAULT_MAX_ROWS), (False, 0, 0), (False, 17, 17)],
+)
+def test_same_job_recovery_uses_only_claimed_job_and_safe_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+    created: bool,
+    export_rows: int | None,
+    expected_rows: int,
+) -> None:
+    period = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 15))
+    failed_id, recovery_id = uuid4(), uuid4()
+    workflow = RecoveryWorkflowDouble(
+        failed_id,
+        recovery_id,
+        export_rows=export_rows,
+        created=created,
+        capacity_rows=export_rows if export_rows is not None else 1,
+    )
+    storage = FakeStorageGuard()
+    verifier = FakeVerifier()
+    subject = MemoryCoordinator(workflow, verifier, storage)  # type: ignore[arg-type]
+    progress: list[dict[str, object]] = []
+    subject._progress = progress.append
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("recovery must not select, traverse, subdivide, or run a leaf")
+
+    for name in ("_period_attempt", "_run_leaf", "_subdivide", "_verified_children"):
+        monkeypatch.setattr(subject, name, forbidden)
+
+    result = run(
+        subject.run(
+            [period],
+            limits=BackfillLimits(max_periods=1, max_leaf_submissions=1),
+            backup_identifier=VALID_BACKUP_IDENTIFIER,
+            recover_failed_job_attempt_id=failed_id,
+            require_pilot=False,
+        )
+    )
+    assert result.status == "completed"
+    assert (result.processed_periods, result.submitted_leaves,
+            result.skipped_completed, result.subdivided_periods) == (1, 0, 0, 0)
+    assert workflow.claim_calls == [
+        (failed_id, period.fiscal_year, period.start, period.end)
+    ]
+    assert len(workflow.resume_calls) == 1
+    assert workflow.resume_calls[0]["recovery_attempt_id"] == recovery_id
+    assert workflow.resume_calls[0]["expected_failed_attempt_id"] == failed_id
+    assert storage.counts == [expected_rows, export_rows if export_rows is not None else 1]
+    assert storage.keys == [recovery_id, recovery_id]
+    assert storage.completed == [recovery_id]
+    assert verifier.verified == [(recovery_id, period)]
+    assert progress == list(result.records)
+    assert [record["event"] for record in result.records if record["event"].startswith("same_job")] == [
+        "same_job_recovery_claimed" if created else "same_job_recovery_resumed"
+    ]
+    for record in result.records:
+        assert not set(record) & {
+            "status_url", "file_url", "remote_file_name", "last_error_detail",
+            "archive_path", "metadata",
+        }
+    for record in result.records:
+        if record["event"] in {
+            "same_job_recovery_claimed", "same_job_recovery_resumed", "leaf_completed"
+        }:
+            assert record["attempt_id"] == str(recovery_id)
+            assert record["recovery_of_attempt_id"] == str(failed_id)
+
+
+@pytest.mark.parametrize(
+    ("roots", "limits", "retry", "recovery", "error"),
+    [
+        ("one", BackfillLimits(max_periods=1), None, "not-a-uuid", "invalid_recovery_authorization"),
+        ("one", BackfillLimits(max_periods=1), "uuid", "uuid", "conflicting_retry_authorizations"),
+        ("none", BackfillLimits(max_periods=1), None, "uuid", "recovery_requires_one_period"),
+        ("two", BackfillLimits(max_periods=1), None, "uuid", "recovery_requires_one_period"),
+        ("one", BackfillLimits(max_periods=2), None, "uuid", "recovery_requires_one_period"),
+        ("one", BackfillLimits(max_leaf_submissions=1), None, "uuid", "recovery_requires_one_period"),
+    ],
+)
+def test_same_job_recovery_requires_exact_authorization_and_one_period(
+    roots: str,
+    limits: BackfillLimits,
+    retry: str | None,
+    recovery: str,
+    error: str,
+) -> None:
+    first = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 15))
+    second = FiscalPeriod(2025, date(2025, 5, 16), date(2025, 5, 31))
+    selected = {"one": [first], "none": [], "two": [first, second]}[roots]
+    failed_id = uuid4()
+    workflow = RecoveryWorkflowDouble(failed_id, uuid4())
+    subject = MemoryCoordinator(
+        workflow, FakeVerifier(), FakeStorageGuard()  # type: ignore[arg-type]
+    )
+    with pytest.raises(BackfillError, match=error):
+        run(
+            subject.run(
+                selected,
+                limits=limits,
+                backup_identifier=VALID_BACKUP_IDENTIFIER,
+                retry_failed_attempt_id=failed_id if retry else None,
+                recover_failed_job_attempt_id=(
+                    failed_id if recovery == "uuid" else recovery  # type: ignore[arg-type]
+                ),
+                require_pilot=False,
+            )
+        )
+    assert workflow.claim_calls == []
+    assert workflow.resume_calls == []
+
+
+@pytest.mark.parametrize(("mode", "expected"), [("initial", "bounded"), ("callback", "bounded"), ("failed", "period_failed")])
+def test_same_job_recovery_bounding_and_failure_do_not_complete_reservation(
+    mode: str, expected: str
+) -> None:
+    period = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 15))
+    failed_id, recovery_id = uuid4(), uuid4()
+    workflow = RecoveryWorkflowDouble(
+        failed_id,
+        recovery_id,
+        export_rows=2 if mode == "initial" else 0,
+        capacity_rows=2 if mode == "callback" else None,
+        result_status="failed" if mode == "failed" else "completed",
+    )
+    storage = FakeStorageGuard()
+    subject = MemoryCoordinator(
+        workflow, FakeVerifier(), storage  # type: ignore[arg-type]
+    )
+    limits = BackfillLimits(
+        max_periods=1,
+        max_estimated_new_bytes=1000 if mode != "failed" else 10000,
+    )
+    if expected == "period_failed":
+        with pytest.raises(BackfillError, match="period_failed"):
+            run(subject.run([period], limits=limits,
+                            backup_identifier=VALID_BACKUP_IDENTIFIER,
+                            recover_failed_job_attempt_id=failed_id,
+                            require_pilot=False))
+    else:
+        result = run(subject.run([period], limits=limits,
+                                 backup_identifier=VALID_BACKUP_IDENTIFIER,
+                                 recover_failed_job_attempt_id=failed_id,
+                                 require_pilot=False))
+        assert result.status == "bounded"
+        assert (result.processed_periods, result.submitted_leaves) == (1, 0)
+    assert storage.completed == []
+    assert len(workflow.resume_calls) == (0 if mode == "initial" else 1)
+
+
+@pytest.mark.parametrize(
+    ("attempt", "error"),
+    [
+        ({"status": "failed", "status_url": "persisted"}, "failed_job_identity_partial"),
+        ({"status": "failed", "status_url": "persisted", "file_url": "file", "remote_file_name": "name.zip"}, "same_job_recovery_required"),
+        ({"status": "failed", "recovery_of_attempt_id": "linked"}, "same_job_recovery_required"),
+        ({"status": "submitted", "recovery_of_attempt_id": "linked"}, "same_job_recovery_required"),
+    ],
+)
+def test_ordinary_retry_rejects_persisted_or_linked_jobs(
+    attempt: dict[str, Any], error: str
+) -> None:
+    period = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 15))
+    failed_id = uuid4()
+    workflow = FakeWorkflow({(period.start, period.end): 1})
+    subject = MemoryCoordinator(
+        workflow, FakeVerifier(), FakeStorageGuard(),
+        attempts={(period.start, period.end): {"id": failed_id, **attempt}},
+    )
+    with pytest.raises(BackfillError, match=error):
+        run(subject.run([period], limits=BackfillLimits(max_periods=1),
+                        backup_identifier=VALID_BACKUP_IDENTIFIER,
+                        retry_failed_attempt_id=failed_id,
+                        require_pilot=False))
+    assert workflow.calls == []
+
+
+def test_completed_linked_recovery_uses_existing_verification_only() -> None:
+    period = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 15))
+    recovery_id = uuid4()
+    workflow = FakeWorkflow({})
+    verifier = FakeVerifier()
+    subject = MemoryCoordinator(
+        workflow, verifier, FakeStorageGuard(),
+        attempts={(period.start, period.end): {
+            "id": recovery_id, "status": "completed",
+            "recovery_of_attempt_id": uuid4(),
+        }},
+    )
+    result = run(subject.run([period], limits=BackfillLimits(max_periods=1),
+                             backup_identifier=VALID_BACKUP_IDENTIFIER,
+                             require_pilot=False))
+    assert result.skipped_completed == 1
+    assert verifier.verified == [(recovery_id, period)]
+    assert workflow.calls == []
+
+
+def test_recovery_path_ast_has_no_export_or_traversal_calls() -> None:
+    tree = ast.parse(Path(transaction_backfill.__file__).read_text())
+    coordinator = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                       and node.name == "BackfillCoordinator")
+    method = next(node for node in coordinator.body if isinstance(node, ast.AsyncFunctionDef)
+                  and node.name == "_run_same_job_recovery")
+    calls = {
+        node.func.attr for node in ast.walk(method)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert calls.isdisjoint({
+        "run_period", "_run_leaf", "_process_period", "_subdivide",
+        "submit_bulk_export", "get_expected_transaction_count", "_period_attempt",
+    })
+    workflow_calls = {
+        node.func.attr for node in ast.walk(method)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_workflow"
+    }
+    assert workflow_calls == {
+        "claim_failed_job_recovery", "resume_failed_job_recovery"
+    }
 
 
 def test_completed_period_is_verified_before_skip() -> None:
@@ -1162,9 +1492,22 @@ class _RestartClient:
         return len(self.archive)
 
 
+class _RecoveryNoPostClient(_RestartClient):
+    def __init__(self, period: FiscalPeriod) -> None:
+        super().__init__(period)
+        self.validated_jobs: list[BulkExportJob] = []
+
+    def validate_persisted_bulk_export_job(self, job: BulkExportJob) -> BulkExportJob:
+        self.validated_jobs.append(job)
+        assert job.file_name == "recovery.zip"
+        return job
+
+
 class _RecordingStorageGuard(StorageGuard):
     def __post_init__(self) -> None:
         self.checked_rows: list[int] = []
+        self.checked_keys: list[object | None] = []
+        self.completed_keys: list[object] = []
         super().__post_init__()
 
     def check(
@@ -1174,10 +1517,130 @@ class _RecordingStorageGuard(StorageGuard):
         reservation_key: object | None = None,
     ) -> StorageDecision:
         self.checked_rows.append(expected_rows)
+        self.checked_keys.append(reservation_key)
         return super().check(
             expected_rows,
             reservation_key=reservation_key,
         )
+
+    def complete(self, reservation_key: object) -> None:
+        self.completed_keys.append(reservation_key)
+        super().complete(reservation_key)
+
+
+@pytest.mark.integration
+def test_coordinator_same_job_recovery_completes_without_post_or_sibling_change(
+    backfill_postgres_engine: Any,
+    tmp_path: Path,
+) -> None:
+    engine = backfill_postgres_engine
+    root = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 31))
+    left_bounds, right_bounds = split_period(root.start, root.end)
+    left = FiscalPeriod(root.fiscal_year, *left_bounds)
+    right = FiscalPeriod(root.fiscal_year, *right_bounds)
+    root_id, failed_id, sibling_id = uuid4(), uuid4(), uuid4()
+    status_url = "https://api.usaspending.gov/api/v2/download/status/rehydrate"
+    file_url = "https://files.usaspending.gov/generated_downloads/recovery.zip"
+    with engine.begin() as connection:
+        for values in (
+            {
+                "id": root_id, "source": "usaspending", "fiscal_year": root.fiscal_year,
+                "period_start": root.start, "period_end": root.end,
+                "status": "subdivided", "expected_rows": DEFAULT_MAX_ROWS + 1,
+                "failure_count": 0, "started_at": NOW, "completed_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+            {
+                "id": failed_id, "source": "usaspending", "fiscal_year": left.fiscal_year,
+                "period_start": left.start, "period_end": left.end,
+                "status": "failed", "expected_rows": 1,
+                "status_url": status_url, "file_url": file_url,
+                "remote_file_name": "recovery.zip", "parent_attempt_id": root_id,
+                "last_error_code": "http_404", "last_error_detail": "synthetic failure",
+                "failure_count": 1, "started_at": NOW, "completed_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+            {
+                "id": sibling_id, "source": "usaspending", "fiscal_year": right.fiscal_year,
+                "period_start": right.start, "period_end": right.end,
+                "status": "created", "parent_attempt_id": root_id,
+                "failure_count": 0, "started_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+        ):
+            connection.execute(
+                UsaSpendingTransactionIngestionAttempt.__table__.insert(), values
+            )
+    with engine.connect() as connection:
+        original = {
+            row["id"]: dict(row) for row in connection.execute(
+                select(UsaSpendingTransactionIngestionAttempt).where(
+                    UsaSpendingTransactionIngestionAttempt.id.in_(
+                        (root_id, failed_id, sibling_id)
+                    )
+                )
+            ).mappings()
+        }
+
+    client = _RecoveryNoPostClient(left)
+
+    @contextmanager
+    def workflow_directory() -> Iterator[Path]:
+        with tempfile.TemporaryDirectory(dir=tmp_path) as name:
+            yield Path(name)
+
+    guard = _RecordingStorageGuard(
+        engine, tmp_path, 10**12, 9 * 10**11, 10**9, 0, Decimal("1")
+    )
+    workflow = TransactionIngestionWorkflow(
+        engine,
+        client,  # type: ignore[arg-type]
+        TransactionIngestionLoader(
+            engine,
+            clock=lambda: NOW,
+            archive_copy_directory=tmp_path,
+            archive_copy_directory_identity=guard.local_identity,
+        ),
+        clock=lambda: NOW,
+        temporary_directory_factory=workflow_directory,
+    )
+    result = run(
+        BackfillCoordinator(
+            engine, workflow, guard,
+            verifier=CompletedPeriodVerifier(engine), clock=lambda: NOW,
+        ).run(
+            [left], limits=BackfillLimits(max_periods=1, max_leaf_submissions=1),
+            backup_identifier=VALID_BACKUP_IDENTIFIER,
+            recover_failed_job_attempt_id=failed_id,
+            require_pilot=False,
+        )
+    )
+
+    assert result.status == "completed"
+    assert (result.processed_periods, result.submitted_leaves,
+            result.skipped_completed, result.subdivided_periods) == (1, 0, 0, 0)
+    assert client.poll_calls == 1
+    assert client.poll_grace_values == [False]
+    assert client.download_calls == 1
+    assert len(client.validated_jobs) >= 2
+    with engine.connect() as connection:
+        rows = connection.execute(
+            select(UsaSpendingTransactionIngestionAttempt)
+        ).mappings().all()
+    by_id = {row["id"]: dict(row) for row in rows}
+    assert all(by_id[attempt_id] == original[attempt_id] for attempt_id in original)
+    recovery_rows = [row for row in rows if row["recovery_of_attempt_id"] == failed_id]
+    assert len(recovery_rows) == 1
+    recovery = recovery_rows[0]
+    assert recovery["status"] == "completed"
+    assert recovery["parent_attempt_id"] == root_id
+    assert guard.checked_keys == [recovery["id"]] * len(guard.checked_keys)
+    assert guard.completed_keys == [recovery["id"]]
+    assert [record["event"] for record in result.records if record["event"] in {
+        "same_job_recovery_claimed", "same_job_recovery_resumed", "leaf_completed"
+    }] == ["same_job_recovery_claimed", "leaf_completed"]
+    assert all("status_url" not in record and "file_url" not in record
+               and "remote_file_name" not in record for record in result.records)
 
 
 @pytest.mark.integration
