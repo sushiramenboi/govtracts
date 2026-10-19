@@ -432,6 +432,8 @@ def main(
             "backup_identifier": backup_identifier,
             "records": progress_records,
         }
+        if args.recover_failed_job_attempt_uuid is not None:
+            payload["submitted_leaves"] = 0
         reservation.write(payload)
 
     try:

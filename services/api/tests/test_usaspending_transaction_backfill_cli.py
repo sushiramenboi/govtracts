@@ -205,13 +205,64 @@ def test_recovery_manifests_keep_safe_lineage_and_zero_submissions(
     assert exit_code == expected_exit
     assert manifest["status"] == status
     assert manifest["records"] == [record]
-    if status != "stopped":
-        assert manifest["submitted_leaves"] == 0
-    else:
+    assert manifest["submitted_leaves"] == 0
+    if status == "stopped":
         assert json.loads(stderr.getvalue()) == {"error_code": "recovery_source_ineligible"}
     assert json.loads(stdout.getvalue().splitlines()[0]) == {"progress": record}
     for sensitive in ("status_url", "file_url", "remote_file_name",
                       "last_error_detail", "credentials", "secret.invalid"):
+        assert sensitive not in manifest_text
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "manifest_status", "expected_code"),
+    [
+        ("interrupted", "interrupted", "backfill_interrupted"),
+        ("unexpected", "stopped", "backfill_operation_failed"),
+    ],
+)
+def test_recovery_interrupted_and_unexpected_stopped_manifests_report_zero_submissions(
+    tmp_path: Path, failure_mode: str, manifest_status: str, expected_code: str,
+) -> None:
+    failed_id, recovery_id = uuid4(), uuid4()
+    record = _recovery_record(failed_id, recovery_id)
+    stdout, stderr = io.StringIO(), io.StringIO()
+
+    class RecoveryRuntime:
+        async def run(self, *_: Any, **__: Any) -> BackfillResult:
+            progress(record)
+            if failure_mode == "interrupted":
+                raise asyncio.CancelledError
+            raise RuntimeError(
+                "status_url=https://secret.invalid/ filename=secret.zip "
+                "credentials=password last_error_detail=secret"
+            )
+
+    @contextmanager
+    def runtime_factory(_args: Any, callback: Any) -> Iterator[RecoveryRuntime]:
+        nonlocal progress
+        progress = callback
+        yield RecoveryRuntime()
+
+    progress: Any = None
+    exit_code = main(
+        _recovery_live_args(tmp_path) + ["--recover-failed-job-attempt-id", str(failed_id)],
+        runtime_factory=runtime_factory, stdout=stdout, stderr=stderr,
+    )
+
+    manifest_text = (tmp_path / "recovery.json").read_text()
+    manifest = json.loads(manifest_text)
+    assert exit_code == EXIT_OPERATION_FAILED
+    assert manifest["status"] == manifest_status
+    assert manifest["error_code"] == expected_code
+    assert manifest["submitted_leaves"] == 0
+    assert manifest["records"] == [record]
+    assert json.loads(stderr.getvalue()) == {"error_code": expected_code}
+    assert json.loads(stdout.getvalue().splitlines()[0]) == {"progress": record}
+    for sensitive in (
+        "status_url", "file_url", "remote_file_name", "filename", "credentials",
+        "last_error_detail", "secret.invalid", "secret.zip", "password",
+    ):
         assert sensitive not in manifest_text
 
 
@@ -565,6 +616,7 @@ def test_live_failure_retains_sanitized_progress_in_exclusive_manifest(
     assert payload["status"] == "stopped"
     assert payload["error_code"] == "backfill_operation_failed"
     assert payload["records"][0]["expected_rows"] == 1
+    assert "submitted_leaves" not in payload
     assert "secret" not in manifest.read_text()
     assert json.loads(stderr.getvalue()) == {
         "error_code": "backfill_operation_failed"
@@ -926,7 +978,9 @@ def test_cancellation_writes_interrupted_manifest_and_closes_runtime(
 
     assert exit_code == EXIT_OPERATION_FAILED
     assert closed
-    assert json.loads(manifest.read_text())["status"] == "interrupted"
+    payload = json.loads(manifest.read_text())
+    assert payload["status"] == "interrupted"
+    assert "submitted_leaves" not in payload
 
 
 def test_live_runtime_threads_one_configured_filesystem_through_all_archives(
