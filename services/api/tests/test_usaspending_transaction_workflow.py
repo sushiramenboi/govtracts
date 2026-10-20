@@ -608,16 +608,22 @@ def test_claim_is_idempotent_and_preserves_parent_and_source_snapshot(
     disposable_postgres_engine: Any,
 ) -> None:
     engine = disposable_postgres_engine
-    parent = attempt_values("failed", attempt_id=uuid4())
-    parent.update(period_start=date(2024, 9, 1), period_end=date(2024, 9, 30), fiscal_year=2024)
-    source = claim_source_values(parent_attempt_id=parent["id"])
+    parent = attempt_values("subdivided", attempt_id=uuid4())
+    parent.update(expected_rows=500001, completed_at=NOW)
+    source = claim_source_values(
+        parent_attempt_id=parent["id"], period_end=date(2024, 10, 16)
+    )
     attempts = UsaSpendingTransactionIngestionAttempt.__table__
     with engine.begin() as connection:
         connection.execute(attempts.insert(), parent)
         connection.execute(attempts.insert(), source)
         original = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
-    first = _claim(engine, source["id"])
-    second = _claim(engine, source["id"])
+    first = claim_workflow(engine).claim_failed_job_recovery(
+        source["id"], FISCAL_YEAR, PERIOD_START, source["period_end"]
+    )
+    second = claim_workflow(engine).claim_failed_job_recovery(
+        source["id"], FISCAL_YEAR, PERIOD_START, source["period_end"]
+    )
     with engine.connect() as connection:
         after = dict(connection.execute(select(attempts).where(attempts.c.id == source["id"])).mappings().one())
         linked = connection.execute(select(attempts).where(attempts.c.recovery_of_attempt_id == source["id"])).mappings().all()
@@ -627,6 +633,43 @@ def test_claim_is_idempotent_and_preserves_parent_and_source_snapshot(
     assert linked[0]["parent_attempt_id"] == parent["id"]
     assert linked[0]["recovery_of_attempt_id"] == source["id"]
     assert after == original
+
+
+@pytest.mark.integration
+def test_claim_rejects_invalid_parent_without_inserting_recovery(
+    disposable_postgres_engine: Any,
+) -> None:
+    engine = disposable_postgres_engine
+    parent = attempt_values("failed")
+    source = claim_source_values(
+        parent_attempt_id=parent["id"], period_end=date(2024, 10, 16)
+    )
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    with engine.begin() as connection:
+        connection.execute(attempts.insert(), parent)
+        connection.execute(attempts.insert(), source)
+        before = {
+            row["id"]: dict(row)
+            for row in connection.execute(select(attempts)).mappings()
+        }
+
+    with pytest.raises(TransactionWorkflowError, match="^unexpected_overlapping_state$"):
+        claim_workflow(engine).claim_failed_job_recovery(
+            source["id"], FISCAL_YEAR, PERIOD_START, source["period_end"]
+        )
+
+    with engine.connect() as connection:
+        after = {
+            row["id"]: dict(row)
+            for row in connection.execute(select(attempts)).mappings()
+        }
+        linked_count = connection.scalar(
+            select(func.count()).select_from(attempts).where(
+                attempts.c.recovery_of_attempt_id == source["id"]
+            )
+        )
+    assert after == before
+    assert linked_count == 0
 
 
 @pytest.mark.integration

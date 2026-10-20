@@ -1529,6 +1529,145 @@ class _RecordingStorageGuard(StorageGuard):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("invalid_parent", ["outside_period", "not_subdivided"])
+def test_recovery_rejects_invalid_ancestry_before_claim_commit(
+    backfill_postgres_engine: Any,
+    invalid_parent: str,
+) -> None:
+    engine = backfill_postgres_engine
+    root = FiscalPeriod(2025, date(2025, 5, 1), date(2025, 5, 31))
+    left_bounds, right_bounds = split_period(root.start, root.end)
+    left = FiscalPeriod(root.fiscal_year, *left_bounds)
+    right = FiscalPeriod(root.fiscal_year, *right_bounds)
+    root_id, outside_id, source_id, sibling_id, checkpoint_id = (
+        uuid4() for _ in range(5)
+    )
+    attempts = UsaSpendingTransactionIngestionAttempt.__table__
+    checkpoints = UsaSpendingIngestionCheckpoint.__table__
+    transactions = UsaSpendingTransaction.__table__
+    root_status = "failed" if invalid_parent == "not_subdivided" else "subdivided"
+    source_parent_id = outside_id if invalid_parent == "outside_period" else root_id
+    with engine.begin() as connection:
+        for values in (
+            {
+                "id": root_id, "source": "usaspending", "fiscal_year": 2025,
+                "period_start": root.start, "period_end": root.end,
+                "status": root_status,
+                "expected_rows": DEFAULT_MAX_ROWS + 1 if root_status == "subdivided" else None,
+                "last_error_code": "synthetic_parent_failure" if root_status == "failed" else None,
+                "failure_count": 1 if root_status == "failed" else 0,
+                "started_at": NOW, "completed_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+            {
+                "id": outside_id, "source": "usaspending", "fiscal_year": 2025,
+                "period_start": date(2025, 4, 1), "period_end": date(2025, 4, 30),
+                "status": "subdivided", "expected_rows": DEFAULT_MAX_ROWS + 1,
+                "failure_count": 0, "started_at": NOW, "completed_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+        ):
+            connection.execute(attempts.insert(), values)
+        connection.execute(checkpoints.insert(), {
+            "id": checkpoint_id, "source": "usaspending", "fiscal_year": 2025,
+            "period_start": right.start, "period_end": right.end,
+            "status": "complete", "archive_sha256": "a" * 64,
+            "expected_rows": 1, "loaded_rows": 1,
+            "started_at": NOW, "completed_at": NOW,
+            "created_at": NOW, "updated_at": NOW,
+        })
+        for values in (
+            {
+                "id": source_id, "source": "usaspending", "fiscal_year": 2025,
+                "period_start": left.start, "period_end": left.end,
+                "parent_attempt_id": source_parent_id, "status": "failed",
+                "expected_rows": 1,
+                "status_url": "https://api.usaspending.gov/api/v2/download/status/rehydrate",
+                "file_url": "https://files.usaspending.gov/generated_downloads/recovery.zip",
+                "remote_file_name": "recovery.zip", "last_error_code": "http_404",
+                "failure_count": 1, "started_at": NOW, "completed_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+            {
+                "id": sibling_id, "source": "usaspending", "fiscal_year": 2025,
+                "period_start": right.start, "period_end": right.end,
+                "parent_attempt_id": root_id, "status": "completed",
+                "expected_rows": 1, "export_rows": 1, "loaded_rows": 1,
+                "export_columns": len(EXPECTED_TRANSACTION_HEADERS),
+                "status_url": "https://api.usaspending.gov/api/v2/download/status/sibling",
+                "file_url": "https://files.usaspending.gov/generated_downloads/sibling.zip",
+                "remote_file_name": "sibling.zip",
+                "archive_sha256": "a" * 64, "archive_bytes": 100,
+                "signed_obligation_total": Decimal("1.00"),
+                "checkpoint_id": checkpoint_id, "failure_count": 0,
+                "started_at": NOW, "completed_at": NOW,
+                "created_at": NOW, "updated_at": NOW,
+            },
+        ):
+            connection.execute(attempts.insert(), values)
+        connection.execute(transactions.insert(), {
+            "stable_transaction_id": "unchanged-sibling-row",
+            "ingestion_checkpoint_id": checkpoint_id,
+            "generated_award_id": "unchanged-award", "display_award_id": "unchanged",
+            "award_type_code": "A", "action_date": right.start,
+            "fiscal_year": 2025, "federal_action_obligation": Decimal("1.00"),
+            "recipient_name": "recipient", "recipient_uei": "ABC123DEF456",
+            "awarding_agency_name": "agency", "awarding_subagency_name": "subagency",
+            "transaction_description": "unchanged", "source_updated_at": NOW,
+            "fetched_at": NOW, "created_at": NOW, "updated_at": NOW,
+        })
+
+    def snapshot() -> tuple[dict[Any, dict[str, Any]], ...]:
+        with engine.connect() as connection:
+            return tuple(
+                {row[key]: dict(row) for row in connection.execute(select(table)).mappings()}
+                for table, key in (
+                    (attempts, "id"), (checkpoints, "id"),
+                    (transactions, "stable_transaction_id"),
+                )
+            )
+
+    before = snapshot()
+    client = _RecoveryNoPostClient(left)
+    storage = FakeStorageGuard()
+
+    def unexpected_directory() -> Any:
+        pytest.fail("rejected recovery must not create a temporary directory")
+
+    workflow = TransactionIngestionWorkflow(
+        engine, client, object(),  # type: ignore[arg-type]
+        temporary_directory_factory=unexpected_directory,
+    )
+    coordinator = BackfillCoordinator(
+        engine, workflow, storage, verifier=FakeVerifier(), clock=lambda: NOW,
+    )
+    with pytest.raises(BackfillError, match="^unexpected_overlapping_state$") as rejection:
+        run(coordinator.run(
+            [left], limits=BackfillLimits(max_periods=1),
+            backup_identifier=VALID_BACKUP_IDENTIFIER,
+            recover_failed_job_attempt_id=source_id, require_pilot=False,
+        ))
+    after = snapshot()
+    linked = [
+        row for row in after[0].values()
+        if row["recovery_of_attempt_id"] == source_id
+    ]
+    assert {
+        attempt_id: row for attempt_id, row in after[0].items()
+        if row["recovery_of_attempt_id"] != source_id
+    } == before[0]
+    assert after[1:] == before[1:]
+    assert client.poll_calls == client.download_calls == 0
+    assert storage.counts == storage.completed == []
+    assert coordinator._submitted == 0
+    linked_count = len(linked)
+    assert linked_count == 0, (
+        f"{invalid_parent}: coordinator_rejected={isinstance(rejection.value, BackfillError)}; "
+        f"expected_linked_count=0; observed_linked_count={linked_count}"
+    )
+
+
+@pytest.mark.integration
 def test_coordinator_same_job_recovery_completes_without_post_or_sibling_change(
     backfill_postgres_engine: Any,
     tmp_path: Path,

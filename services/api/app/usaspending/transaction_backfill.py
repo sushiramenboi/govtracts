@@ -49,6 +49,7 @@ from app.usaspending.transaction_workflow import (
     TransactionIngestionWorkflow,
     TransactionWorkflowError,
     TransactionWorkflowResult,
+    assert_owned_period_state_on_connection,
 )
 
 
@@ -820,12 +821,17 @@ class BackfillCoordinator:
         failed_attempt_id: UUID,
         limits: BackfillLimits,
     ) -> bool:
-        claim = self._workflow.claim_failed_job_recovery(
-            failed_attempt_id,
-            period.fiscal_year,
-            period.start,
-            period.end,
-        )
+        try:
+            claim = self._workflow.claim_failed_job_recovery(
+                failed_attempt_id,
+                period.fiscal_year,
+                period.start,
+                period.end,
+            )
+        except TransactionWorkflowError as exc:
+            if str(exc) == "unexpected_overlapping_state":
+                raise BackfillError("unexpected_overlapping_state") from None
+            raise
         recovery_id = claim.recovery_attempt_id
         if claim.failed_attempt_id != failed_attempt_id or not isinstance(
             recovery_id, UUID
@@ -1034,161 +1040,15 @@ class BackfillCoordinator:
         exact_attempt: Mapping[str, Any] | None,
     ) -> None:
         """Reject overlap except the exact attempt's verified tree-owned state."""
-        checkpoints = UsaSpendingIngestionCheckpoint.__table__
-        transactions = UsaSpendingTransaction.__table__
         with self._engine.connect() as connection:
-            attempts = connection.execute(
-                select(self._attempts).where(
-                    and_(
-                        self._attempts.c.source == SOURCE,
-                        self._attempts.c.period_start <= period.end,
-                        self._attempts.c.period_end >= period.start,
-                    )
+            try:
+                assert_owned_period_state_on_connection(
+                    connection, period, exact_attempt=exact_attempt
                 )
-            ).mappings().all()
-            allowed_attempt_ids = self._owned_attempt_ids(
-                attempts,
-                exact_attempt=exact_attempt,
-                period=period,
-            )
-            if any(row["id"] not in allowed_attempt_ids for row in attempts):
-                raise BackfillError("unexpected_overlapping_state")
-
-            allowed_checkpoint_ids = {
-                row["checkpoint_id"]
-                for row in attempts
-                if row["id"] in allowed_attempt_ids
-                and isinstance(row["checkpoint_id"], UUID)
-            }
-            checkpoint_ids = set(
-                connection.scalars(
-                    select(checkpoints.c.id).where(
-                        and_(
-                            checkpoints.c.source == SOURCE,
-                            checkpoints.c.period_start <= period.end,
-                            checkpoints.c.period_end >= period.start,
-                        )
-                    )
-                )
-            )
-            if checkpoint_ids - allowed_checkpoint_ids:
-                raise BackfillError("unexpected_overlapping_state")
-
-            transaction_filter = transactions.c.action_date.between(
-                period.start, period.end
-            )
-            if allowed_checkpoint_ids:
-                transaction_filter = and_(
-                    transaction_filter,
-                    or_(
-                        transactions.c.ingestion_checkpoint_id.is_(None),
-                        transactions.c.ingestion_checkpoint_id.not_in(
-                            allowed_checkpoint_ids
-                        ),
-                    ),
-                )
-            transaction_overlap = connection.scalar(
-                select(func.count()).where(transaction_filter)
-            )
-        if transaction_overlap:
-            raise BackfillError("unexpected_overlapping_state")
-
-    def _owned_attempt_ids(
-        self,
-        rows: Sequence[Mapping[str, Any]],
-        *,
-        exact_attempt: Mapping[str, Any] | None,
-        period: FiscalPeriod,
-    ) -> set[UUID]:
-        if exact_attempt is None:
-            return set()
-        exact_id = exact_attempt.get("id")
-        if not isinstance(exact_id, UUID):
-            raise BackfillError("unexpected_overlapping_state")
-        by_id = {row["id"]: row for row in rows}
-        root = by_id.get(exact_id)
-        if root is None:
-            raise BackfillError("unexpected_overlapping_state")
-
-        allowed: set[UUID] = set()
-
-        def allow_failed_peers(
-            current: Mapping[str, Any], current_period: FiscalPeriod
-        ) -> None:
-            for peer in rows:
-                if (
-                    peer["id"] != current["id"]
-                    and peer["status"] == "failed"
-                    and peer["parent_attempt_id"] == current["parent_attempt_id"]
-                    and peer["period_start"] == current_period.start
-                    and peer["period_end"] == current_period.end
-                ):
-                    allowed.add(peer["id"])
-
-        ancestor = root
-        seen_ancestor_ids = {exact_id}
-        while isinstance(ancestor["parent_attempt_id"], UUID):
-            parent_id = ancestor["parent_attempt_id"]
-            if parent_id in seen_ancestor_ids:
-                raise BackfillError("unexpected_overlapping_state")
-            parent = by_id.get(parent_id)
-            if parent is None or parent["status"] != "subdivided":
-                raise BackfillError("unexpected_overlapping_state")
-            parent_period = FiscalPeriod(
-                parent["fiscal_year"], parent["period_start"], parent["period_end"]
-            )
-            if (
-                ancestor["period_start"],
-                ancestor["period_end"],
-            ) not in split_period(parent_period.start, parent_period.end):
-                raise BackfillError("unexpected_overlapping_state")
-            allowed.add(parent_id)
-            allow_failed_peers(parent, parent_period)
-            seen_ancestor_ids.add(parent_id)
-            ancestor = parent
-
-        def visit(current: Mapping[str, Any], current_period: FiscalPeriod) -> None:
-            current_id = current["id"]
-            allowed.add(current_id)
-            allow_failed_peers(current, current_period)
-            children = [
-                row for row in rows if row["parent_attempt_id"] == current_id
-            ]
-            if current["status"] != "subdivided":
-                if children:
-                    raise BackfillError("unexpected_overlapping_state")
-                return
-            expected_bounds = split_period(current_period.start, current_period.end)
-            for child_start, child_end in expected_bounds:
-                candidates = [
-                    row
-                    for row in children
-                    if row["period_start"] == child_start
-                    and row["period_end"] == child_end
-                ]
-                current_candidates = [
-                    row for row in candidates if row["status"] != "failed"
-                ]
-                if len(current_candidates) > 1 or not candidates:
-                    raise BackfillError("unexpected_overlapping_state")
-                selected = (
-                    current_candidates[0]
-                    if current_candidates
-                    else max(candidates, key=lambda row: (row["created_at"], row["id"]))
-                )
-                allowed.update(row["id"] for row in candidates if row["status"] == "failed")
-                visit(
-                    selected,
-                    FiscalPeriod(period.fiscal_year, child_start, child_end),
-                )
-            if any(
-                (row["period_start"], row["period_end"]) not in expected_bounds
-                for row in children
-            ):
-                raise BackfillError("unexpected_overlapping_state")
-
-        visit(root, period)
-        return allowed
+            except TransactionWorkflowError as exc:
+                if str(exc) == "unexpected_overlapping_state":
+                    raise BackfillError("unexpected_overlapping_state") from None
+                raise
 
     def _read_attempt(self, attempt_id: UUID) -> Mapping[str, Any]:
         with self._engine.connect() as connection:

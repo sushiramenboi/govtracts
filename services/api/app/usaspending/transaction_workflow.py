@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import re
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Engine, and_, func, insert, select, text, update
+from sqlalchemy import Engine, and_, func, insert, or_, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -32,7 +32,12 @@ from app.usaspending.client import (
     UsaSpendingClient,
     UsaSpendingError,
 )
-from app.usaspending.fiscal_years import fiscal_month_bounds, validate_subperiod
+from app.usaspending.fiscal_years import (
+    FiscalPeriod,
+    fiscal_month_bounds,
+    split_period,
+    validate_subperiod,
+)
 from app.usaspending.transaction_export import DEFAULT_MAX_ROWS, TransactionExportError
 from app.usaspending.transaction_ingestion import (
     BulkJobMetadata,
@@ -126,6 +131,155 @@ def _private_temporary_directory() -> Iterator[Path]:
         yield Path(name)
 
 
+def assert_owned_period_state_on_connection(
+    connection: Connection,
+    period: FiscalPeriod,
+    *,
+    exact_attempt: Mapping[str, Any] | None,
+) -> None:
+    """Validate overlapping attempts and data using the claim's transaction."""
+    attempts_table = UsaSpendingTransactionIngestionAttempt.__table__
+    checkpoints = UsaSpendingIngestionCheckpoint.__table__
+    transactions = UsaSpendingTransaction.__table__
+    attempts = connection.execute(
+        select(attempts_table).where(
+            and_(
+                attempts_table.c.source == SOURCE,
+                attempts_table.c.period_start <= period.end,
+                attempts_table.c.period_end >= period.start,
+            )
+        )
+    ).mappings().all()
+    allowed_attempt_ids = _owned_attempt_ids(
+        attempts, exact_attempt=exact_attempt, period=period
+    )
+    if any(row["id"] not in allowed_attempt_ids for row in attempts):
+        raise TransactionWorkflowError("unexpected_overlapping_state")
+
+    allowed_checkpoint_ids = {
+        row["checkpoint_id"]
+        for row in attempts
+        if row["id"] in allowed_attempt_ids
+        and isinstance(row["checkpoint_id"], UUID)
+    }
+    checkpoint_ids = set(
+        connection.scalars(
+            select(checkpoints.c.id).where(
+                and_(
+                    checkpoints.c.source == SOURCE,
+                    checkpoints.c.period_start <= period.end,
+                    checkpoints.c.period_end >= period.start,
+                )
+            )
+        )
+    )
+    if checkpoint_ids - allowed_checkpoint_ids:
+        raise TransactionWorkflowError("unexpected_overlapping_state")
+
+    transaction_filter = transactions.c.action_date.between(period.start, period.end)
+    if allowed_checkpoint_ids:
+        transaction_filter = and_(
+            transaction_filter,
+            or_(
+                transactions.c.ingestion_checkpoint_id.is_(None),
+                transactions.c.ingestion_checkpoint_id.not_in(allowed_checkpoint_ids),
+            ),
+        )
+    if connection.scalar(select(func.count()).where(transaction_filter)):
+        raise TransactionWorkflowError("unexpected_overlapping_state")
+
+
+def _owned_attempt_ids(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    exact_attempt: Mapping[str, Any] | None,
+    period: FiscalPeriod,
+) -> set[UUID]:
+    if exact_attempt is None:
+        return set()
+    exact_id = exact_attempt.get("id")
+    if not isinstance(exact_id, UUID):
+        raise TransactionWorkflowError("unexpected_overlapping_state")
+    by_id = {row["id"]: row for row in rows}
+    root = by_id.get(exact_id)
+    if root is None:
+        raise TransactionWorkflowError("unexpected_overlapping_state")
+
+    allowed: set[UUID] = set()
+
+    def allow_failed_peers(
+        current: Mapping[str, Any], current_period: FiscalPeriod
+    ) -> None:
+        for peer in rows:
+            if (
+                peer["id"] != current["id"]
+                and peer["status"] == "failed"
+                and peer["parent_attempt_id"] == current["parent_attempt_id"]
+                and peer["period_start"] == current_period.start
+                and peer["period_end"] == current_period.end
+            ):
+                allowed.add(peer["id"])
+
+    ancestor = root
+    seen_ancestor_ids = {exact_id}
+    while isinstance(ancestor["parent_attempt_id"], UUID):
+        parent_id = ancestor["parent_attempt_id"]
+        if parent_id in seen_ancestor_ids:
+            raise TransactionWorkflowError("unexpected_overlapping_state")
+        parent = by_id.get(parent_id)
+        if parent is None or parent["status"] != "subdivided":
+            raise TransactionWorkflowError("unexpected_overlapping_state")
+        parent_period = FiscalPeriod(
+            parent["fiscal_year"], parent["period_start"], parent["period_end"]
+        )
+        if (
+            ancestor["period_start"],
+            ancestor["period_end"],
+        ) not in split_period(parent_period.start, parent_period.end):
+            raise TransactionWorkflowError("unexpected_overlapping_state")
+        allowed.add(parent_id)
+        allow_failed_peers(parent, parent_period)
+        seen_ancestor_ids.add(parent_id)
+        ancestor = parent
+
+    def visit(current: Mapping[str, Any], current_period: FiscalPeriod) -> None:
+        current_id = current["id"]
+        allowed.add(current_id)
+        allow_failed_peers(current, current_period)
+        children = [row for row in rows if row["parent_attempt_id"] == current_id]
+        if current["status"] != "subdivided":
+            if children:
+                raise TransactionWorkflowError("unexpected_overlapping_state")
+            return
+        expected_bounds = split_period(current_period.start, current_period.end)
+        for child_start, child_end in expected_bounds:
+            candidates = [
+                row for row in children
+                if row["period_start"] == child_start
+                and row["period_end"] == child_end
+            ]
+            current_candidates = [
+                row for row in candidates if row["status"] != "failed"
+            ]
+            if len(current_candidates) > 1 or not candidates:
+                raise TransactionWorkflowError("unexpected_overlapping_state")
+            selected = (
+                current_candidates[0]
+                if current_candidates
+                else max(candidates, key=lambda row: (row["created_at"], row["id"]))
+            )
+            allowed.update(row["id"] for row in candidates if row["status"] == "failed")
+            visit(selected, FiscalPeriod(period.fiscal_year, child_start, child_end))
+        if any(
+            (row["period_start"], row["period_end"]) not in expected_bounds
+            for row in children
+        ):
+            raise TransactionWorkflowError("unexpected_overlapping_state")
+
+    visit(root, period)
+    return allowed
+
+
 class TransactionIngestionWorkflow:
     """Advance one FY/month attempt through the restartable state machine."""
 
@@ -192,6 +346,11 @@ class TransactionIngestionWorkflow:
                 if conflict is not None:
                     raise TransactionWorkflowError("recovery_period_conflict")
                 self._require_empty_recovery_period(connection, source)
+                assert_owned_period_state_on_connection(
+                    connection,
+                    FiscalPeriod(fiscal_year, period_start, period_end),
+                    exact_attempt=source,
+                )
 
                 recovery_id = uuid4()
                 now = self._aware_now()
