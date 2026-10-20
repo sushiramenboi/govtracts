@@ -45,7 +45,10 @@ from app.usaspending.transaction_ingestion import (
     TransactionIngestionLoader,
     probe_private_directory,
 )
-from app.usaspending.transaction_workflow import TransactionIngestionWorkflow
+from app.usaspending.transaction_workflow import (
+    TransactionIngestionWorkflow,
+    TransactionWorkflowError,
+)
 
 
 EXIT_COMPLETED = 0
@@ -54,6 +57,45 @@ EXIT_OPERATOR_RESOLUTION = 30
 EXIT_INVALID_ARGUMENTS = 64
 EXIT_OPERATION_FAILED = 70
 ROOT_MONTH = re.compile(r"(20[0-9]{2})-(0[1-9]|1[0-2])\Z")
+RECOVERY_OPERATOR_CODES = frozenset(
+    {
+        "conflicting_retry_authorizations",
+        "failed_job_identity_partial",
+        "invalid_failed_attempt_id",
+        "invalid_recovery_attempt_id",
+        "invalid_recovery_authorization",
+        "recovery_attempt_mismatch",
+        "recovery_attempt_not_found",
+        "recovery_authorization_required",
+        "recovery_claim_conflict",
+        "recovery_claim_mismatch",
+        "recovery_job_absent",
+        "recovery_job_corrupt",
+        "recovery_job_identity_mismatch",
+        "recovery_job_unsafe",
+        "recovery_lineage_mismatch",
+        "recovery_link_conflict",
+        "recovery_link_invalid",
+        "recovery_period_conflict",
+        "recovery_period_not_empty",
+        "recovery_requires_one_period",
+        "recovery_source_dirty",
+        "recovery_source_ineligible",
+        "same_job_recovery_required",
+    }
+)
+RECOVERY_INTEGRITY_CODES = frozenset(
+    {
+        "completed_attempt_corrupt",
+        "completed_attempt_missing",
+        "completed_checkpoint_corrupt",
+        "completed_period_corrupt",
+        "completed_period_mismatch",
+        "completed_transactions_corrupt",
+        "invalid_persisted_export_rows",
+        "unexpected_overlapping_state",
+    }
+)
 
 
 class _Runtime(Protocol):
@@ -64,6 +106,7 @@ class _Runtime(Protocol):
         limits: BackfillLimits,
         backup_identifier: str,
         retry_failed_attempt_id: UUID | None,
+        recover_failed_job_attempt_id: UUID | None,
     ) -> BackfillResult: ...
 
 
@@ -118,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-failures", type=int, action=_SingleValueAction)
     parser.add_argument("--backup-identifier", action=_SingleValueAction)
     parser.add_argument("--retry-failed-attempt-id", action=_SingleValueAction)
+    parser.add_argument("--recover-failed-job-attempt-id", action=_SingleValueAction)
     parser.add_argument(
         "--database-volume-capacity-bytes", type=int, action=_SingleValueAction
     )
@@ -174,6 +218,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.confirmation_token = confirmation_token(args.roots)
     if args.max_failures is not None and args.max_failures != 1:
         parser.error("max failures is fixed")
+    if (
+        args.retry_failed_attempt_id is not None
+        and args.recover_failed_job_attempt_id is not None
+    ):
+        parser.error("conflicting retry authorizations")
+    try:
+        args.recover_failed_job_attempt_uuid = (
+            UUID(args.recover_failed_job_attempt_id)
+            if args.recover_failed_job_attempt_id is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        parser.error("invalid recovery authorization")
+    if args.recover_failed_job_attempt_uuid is not None:
+        if not args.execute_live:
+            parser.error("recovery requires live execution")
+        if not has_period_start or not has_period_end or args.root_month is not None:
+            parser.error("recovery requires explicit period bounds")
+        if len(args.roots) != 1 or args.max_periods != 1:
+            parser.error("recovery requires one bounded period")
 
     if not args.execute_live:
         return args
@@ -368,6 +432,8 @@ def main(
             "backup_identifier": backup_identifier,
             "records": progress_records,
         }
+        if args.recover_failed_job_attempt_uuid is not None:
+            payload["submitted_leaves"] = 0
         reservation.write(payload)
 
     try:
@@ -379,6 +445,7 @@ def main(
                         limits=args.limits,
                         backup_identifier=args.backup_identifier,
                         retry_failed_attempt_id=args.retry_failed_attempt_uuid,
+                        recover_failed_job_attempt_id=args.recover_failed_job_attempt_uuid,
                     )
                 )
             payload = safe_result_manifest(
@@ -386,14 +453,27 @@ def main(
                 backup_identifier=args.backup_identifier,
             )
             manifest.write(payload)
-        except BackfillError as error:
+        except (BackfillError, TransactionWorkflowError) as error:
+            code = error.code if isinstance(error, BackfillError) else str(error)
+            operator_resolution = (
+                code in RECOVERY_OPERATOR_CODES
+                or (
+                    args.recover_failed_job_attempt_uuid is not None
+                    and code in RECOVERY_INTEGRITY_CODES
+                )
+            )
+            safe_code = (
+                code
+                if isinstance(error, BackfillError) or operator_resolution
+                else "backfill_operation_failed"
+            )
             try:
-                write_stopped_manifest(manifest, "stopped", error.code)
+                write_stopped_manifest(manifest, "stopped", safe_code)
             except BackfillError as manifest_error:
                 _write_json(errors, {"error_code": manifest_error.code})
                 return EXIT_OPERATION_FAILED
-            _write_json(errors, {"error_code": error.code})
-            if error.code in {
+            _write_json(errors, {"error_code": safe_code})
+            if operator_resolution or code in {
                 "submission_unknown_requires_operator",
                 "failed_attempt_requires_authorization",
                 "pilot_anchor_mismatch",

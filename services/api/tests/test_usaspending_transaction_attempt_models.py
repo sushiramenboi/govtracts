@@ -3,7 +3,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import CheckConstraint, Numeric, create_engine, select, update
+from sqlalchemy import CheckConstraint, Numeric, Uuid, create_engine, select, update
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -84,6 +84,7 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "signed_obligation_total",
         "checkpoint_id",
         "parent_attempt_id",
+        "recovery_of_attempt_id",
         "last_error_code",
         "last_error_detail",
         "failure_count",
@@ -107,12 +108,17 @@ def test_attempt_model_declares_restart_state_contract() -> None:
             "usaspending_transaction_ingestion_attempts.id",
             "RESTRICT",
         ),
+        "fk_usaspending_attempt_recovery_of": (
+            "usaspending_transaction_ingestion_attempts.id",
+            "RESTRICT",
+        ),
     }
     assert {index.name: index.unique for index in table.indexes} == {
         "ix_usaspending_attempts_parent": False,
         "ix_usaspending_attempts_period_status": False,
         "uq_usaspending_attempts_active_period": True,
         "uq_usaspending_attempts_parent_period": True,
+        "uq_usaspending_attempts_recovery_of": True,
     }
     active_index = next(
         index
@@ -136,6 +142,7 @@ def test_attempt_model_declares_restart_state_contract() -> None:
         "ck_usaspending_transaction_ingestion_attempts_hash_lower_hex",
         "ck_usaspending_transaction_ingestion_attempts_job_metadata",
         "ck_usaspending_transaction_ingestion_attempts_not_self_parent",
+        "ck_usaspending_transaction_ingestion_attempts_not_self_recovery",
         "ck_usaspending_transaction_ingestion_attempts_period_order",
         "ck_usaspending_transaction_ingestion_attempts_status_allowed",
         "ck_usaspending_transaction_ingestion_attempts_subdivision",
@@ -155,6 +162,53 @@ def test_attempt_model_declares_restart_state_contract() -> None:
     )
     assert str(parent_period_index.dialect_options["postgresql"]["where"]) == (
         "parent_attempt_id IS NOT NULL AND status != 'failed'"
+    )
+
+
+def test_attempt_model_declares_recovery_lineage() -> None:
+    table = models.UsaSpendingTransactionIngestionAttempt.__table__
+
+    assert "recovery_of_attempt_id" in table.c
+    column = table.c.recovery_of_attempt_id
+    assert isinstance(column.type, Uuid)
+    assert column.nullable is True
+    assert {
+        foreign_key.constraint.name: (foreign_key.target_fullname, foreign_key.ondelete)
+        for foreign_key in column.foreign_keys
+    } == {
+        "fk_usaspending_attempt_recovery_of": (
+            "usaspending_transaction_ingestion_attempts.id",
+            "RESTRICT",
+        ),
+    }
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert checks[
+        "ck_usaspending_transaction_ingestion_attempts_not_self_recovery"
+    ] == "recovery_of_attempt_id IS NULL OR recovery_of_attempt_id != id"
+    lineage_index = next(
+        index
+        for index in table.indexes
+        if index.name == "uq_usaspending_attempts_recovery_of"
+    )
+    assert lineage_index.unique is True
+    assert tuple(column.name for column in lineage_index.columns) == (
+        "recovery_of_attempt_id",
+    )
+    for dialect in ("postgresql", "sqlite"):
+        assert str(lineage_index.dialect_options[dialect]["where"]) == (
+            "recovery_of_attempt_id IS NOT NULL"
+        )
+    assert all(
+        len(name.encode("utf-8")) <= 63
+        for name in (
+            "fk_usaspending_attempt_recovery_of",
+            "ck_usaspending_transaction_ingestion_attempts_not_self_recovery",
+            "uq_usaspending_attempts_recovery_of",
+        )
     )
 
 
