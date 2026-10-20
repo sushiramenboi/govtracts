@@ -11,12 +11,16 @@ from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from app.core.config import load_settings
+from app.db.base import Base
 from app.db.models import UsaSpendingTransactionIngestionAttempt
 
 
@@ -44,6 +48,18 @@ RECOVERY_MIGRATION_PATH = (
     / "alembic"
     / "versions"
     / "20261017_0007_usaspending_same_job_recovery.py"
+)
+RENAME_MIGRATION_PATH = (
+    API_ROOT
+    / "alembic"
+    / "versions"
+    / "20261020_0008_normalize_usaspending_recovery_check_name.py"
+)
+GENERATED_RECOVERY_CHECK = (
+    "ck_usaspending_transaction_ingestion_attempts_ck_usaspe_ca28"
+)
+MODEL_RECOVERY_CHECK = (
+    "ck_usaspending_transaction_ingestion_attempts_not_self_recovery"
 )
 MIGRATION_0005_TERMINAL_CHECK = (
     "((status IN ('completed', 'failed')) = (completed_at IS NOT NULL)) AND "
@@ -409,6 +425,39 @@ def test_recovery_migration_compiles_for_postgresql(
     )
 
 
+def test_recovery_check_rename_migration_uses_exact_postgresql_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_migration(RENAME_MIGRATION_PATH, "recovery_check_0008_ddl")
+    output = io.StringIO()
+    operations = Operations(
+        MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+    )
+    monkeypatch.setattr(migration, "op", operations)
+
+    assert migration.revision == "20261020_0008"
+    assert migration.down_revision == "20261017_0007"
+    assert migration.GENERATED_NAME == GENERATED_RECOVERY_CHECK
+    assert migration.MODEL_NAME == MODEL_RECOVERY_CHECK
+    assert max(
+        len(name.encode("utf-8"))
+        for name in (migration.TABLE_NAME, migration.GENERATED_NAME, migration.MODEL_NAME)
+    ) <= 63
+
+    migration.upgrade()
+    migration.downgrade()
+    statements = [line.rstrip(";") for line in output.getvalue().splitlines() if line]
+    assert statements == [
+        'ALTER TABLE "usaspending_transaction_ingestion_attempts" '
+        f'RENAME CONSTRAINT "{GENERATED_RECOVERY_CHECK}" TO "{MODEL_RECOVERY_CHECK}"',
+        'ALTER TABLE "usaspending_transaction_ingestion_attempts" '
+        f'RENAME CONSTRAINT "{MODEL_RECOVERY_CHECK}" TO "{GENERATED_RECOVERY_CHECK}"',
+    ]
+
+
 def test_migration_compiles_for_postgresql_with_bounded_identifiers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -466,6 +515,40 @@ def _test_database_url() -> str:
             "TEST_DATABASE_URL must point to a disposable database ending in _test"
         )
     return value
+
+
+@pytest.mark.integration
+def test_live_postgresql_head_recovery_check_name_matches_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disposable_url = _test_database_url()
+    monkeypatch.setenv("DATABASE_URL", disposable_url)
+    load_settings.cache_clear()
+    try:
+        command.upgrade(Config(str(API_ROOT / "alembic.ini")), "head")
+        engine = create_engine(disposable_url)
+        try:
+            with engine.connect() as connection:
+                names = connection.execute(
+                    sa.text(
+                        "SELECT conname FROM pg_catalog.pg_constraint "
+                        "WHERE conrelid = "
+                        "'public.usaspending_transaction_ingestion_attempts'::regclass "
+                        "AND contype = 'c' "
+                        "AND pg_get_constraintdef(oid) LIKE '%recovery_of_attempt_id%'"
+                    )
+                ).scalars().all()
+        finally:
+            engine.dispose()
+
+        expected = (
+            "ck_usaspending_transaction_ingestion_attempts_not_self_recovery"
+        )
+        assert names == [expected], (
+            f"expected recovery check {expected}; observed {names}"
+        )
+    finally:
+        load_settings.cache_clear()
 
 
 def _prepare_live_migration(
@@ -1414,6 +1497,168 @@ def test_live_postgresql_0007_preserves_and_enforces_recovery_lineage(
                     "usaspending_transaction_ingestion_attempts"
                 )
             }
+    finally:
+        _drop_live_schema(engine, schema)
+
+
+@pytest.mark.integration
+def test_live_postgresql_0008_renames_only_recovery_check_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, schema, _ = _prepare_live_migration_0006(monkeypatch)
+    recovery = _load_migration(RECOVERY_MIGRATION_PATH, f"recovery_0007_{schema}")
+    rename = _load_migration(RENAME_MIGRATION_PATH, f"recovery_0008_{schema}")
+    table_name = "usaspending_transaction_ingestion_attempts"
+    now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+
+    def catalog_and_rows(connection: sa.Connection) -> tuple[dict, tuple, dict]:
+        check_rows = connection.execute(
+            sa.text(
+                "SELECT oid::text AS oid, conname, convalidated, "
+                "conbin::text AS expression, pg_get_constraintdef(oid) AS definition "
+                "FROM pg_catalog.pg_constraint "
+                "WHERE conrelid = to_regclass('usaspending_transaction_ingestion_attempts') "
+                "AND contype = 'c' "
+                "AND pg_get_constraintdef(oid) LIKE '%recovery_of_attempt_id%'"
+            )
+        ).mappings().all()
+        assert len(check_rows) == 1
+        companions = (
+            tuple(
+                connection.execute(
+                    sa.text(
+                        "SELECT conname, contype, pg_get_constraintdef(oid) "
+                        "FROM pg_catalog.pg_constraint "
+                        "WHERE conrelid = to_regclass('usaspending_transaction_ingestion_attempts') "
+                        "AND conname NOT IN (:generated, :model) ORDER BY conname"
+                    ),
+                    {"generated": GENERATED_RECOVERY_CHECK, "model": MODEL_RECOVERY_CHECK},
+                ).all()
+            ),
+            tuple(
+                connection.execute(
+                    sa.text(
+                        "SELECT i.relname, pg_get_indexdef(i.oid) FROM pg_class AS i "
+                        "JOIN pg_index AS x ON x.indexrelid = i.oid "
+                        "WHERE x.indrelid = to_regclass('usaspending_transaction_ingestion_attempts') "
+                        "ORDER BY i.relname"
+                    )
+                ).all()
+            ),
+            tuple(
+                connection.execute(
+                    sa.text(
+                        "SELECT attname, format_type(atttypid, atttypmod), attnotnull "
+                        "FROM pg_attribute "
+                        "WHERE attrelid = to_regclass('usaspending_transaction_ingestion_attempts') "
+                        "AND attname = 'recovery_of_attempt_id' AND NOT attisdropped"
+                    )
+                ).all()
+            ),
+        )
+        attempts = sa.Table(table_name, sa.MetaData(), autoload_with=connection)
+        return dict(check_rows[0]), companions, _read_normalized_attempt_rows(
+            connection, attempts
+        )
+
+    def assert_self_recovery_rejected(connection: sa.Connection, name: str) -> None:
+        attempts = sa.Table(table_name, sa.MetaData(), autoload_with=connection)
+        attempt_id = uuid4()
+        with pytest.raises(IntegrityError) as failure:
+            with connection.begin_nested():
+                connection.execute(
+                    attempts.insert(),
+                    {
+                        "id": attempt_id,
+                        "source": "usaspending",
+                        "fiscal_year": 2025,
+                        "period_start": date(2024, 11, 1),
+                        "period_end": date(2024, 11, 30),
+                        "status": "created",
+                        "failure_count": 0,
+                        "started_at": now,
+                        "created_at": now,
+                        "updated_at": now,
+                        "recovery_of_attempt_id": attempt_id,
+                    },
+                )
+        assert failure.value.orig.diag.constraint_name == name
+
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+            monkeypatch.setattr(
+                recovery,
+                "op",
+                Operations(
+                    MigrationContext.configure(
+                        connection, opts={"target_metadata": Base.metadata}
+                    )
+                ),
+            )
+            recovery.upgrade()
+            attempts = sa.Table(table_name, sa.MetaData(), autoload_with=connection)
+            base = {
+                "source": "usaspending",
+                "fiscal_year": 2025,
+                "failure_count": 0,
+                "started_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": uuid4(),
+                    **base,
+                    "period_start": date(2024, 10, 1),
+                    "period_end": date(2024, 10, 16),
+                    "status": "failed",
+                    "last_error_code": "http_404",
+                    "completed_at": now,
+                },
+            )
+            connection.execute(
+                attempts.insert(),
+                {
+                    "id": uuid4(),
+                    **base,
+                    "period_start": date(2024, 10, 17),
+                    "period_end": date(2024, 10, 31),
+                    "status": "created",
+                },
+            )
+            original_check, original_companions, original_rows = catalog_and_rows(
+                connection
+            )
+            assert original_check["conname"] == GENERATED_RECOVERY_CHECK
+            assert original_check["convalidated"] is True
+            assert len(original_rows) == 2
+            assert_self_recovery_rejected(connection, GENERATED_RECOVERY_CHECK)
+
+        for operation, expected_name in (
+            (rename.upgrade, MODEL_RECOVERY_CHECK),
+            (rename.downgrade, GENERATED_RECOVERY_CHECK),
+            (rename.upgrade, MODEL_RECOVERY_CHECK),
+        ):
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+                monkeypatch.setattr(
+                    rename, "op", Operations(MigrationContext.configure(connection))
+                )
+                operation()
+                check, companions, rows = catalog_and_rows(connection)
+                assert check["conname"] == expected_name
+                assert {
+                    key: value for key, value in check.items() if key != "conname"
+                } == {
+                    key: value
+                    for key, value in original_check.items()
+                    if key != "conname"
+                }
+                assert companions == original_companions
+                assert rows == original_rows
+                assert_self_recovery_rejected(connection, expected_name)
     finally:
         _drop_live_schema(engine, schema)
 
